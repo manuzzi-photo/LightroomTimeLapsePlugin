@@ -51,6 +51,13 @@ local function targetDims(props)
 	return w, h
 end
 
+local function effectiveFps(props)
+	if props.fps == 'custom' then
+		return tonumber(props.customFps) or 30
+	end
+	return tonumber(props.fps) or 30
+end
+
 local function sanitizeFileName(name)
 	name = tostring(name or ''):gsub('[/\\:%*%?"<>|]', '-'):gsub('^%s+', ''):gsub('%s+$', '')
 	if name == '' then
@@ -78,7 +85,7 @@ end
 -- Preferences (remembered between sessions)
 
 local REMEMBERED = {
-	'resolution', 'orientation', 'fit', 'fps', 'codec', 'qualityPreset',
+	'resolution', 'orientation', 'fit', 'fps', 'customFps', 'codec', 'qualityPreset',
 	'deflicker', 'deflickerSize', 'previewRes', 'outputFolder',
 }
 
@@ -167,7 +174,7 @@ local function runGeneration(props, photos, aspects)
 	local ok, status, tail = FFmpegRunner.run({
 		ffmpegPath = props.ffmpegPath,
 		inputPattern = result.pattern,
-		fps = tonumber(props.fps) or 30,
+		fps = effectiveFps(props),
 		width = targetW,
 		height = targetH,
 		fit = props.fit,
@@ -200,7 +207,7 @@ local function runGeneration(props, photos, aspects)
 
 	LrFileUtils.delete(sessionDir)
 
-	local seconds = result.count / (tonumber(props.fps) or 30)
+	local seconds = result.count / effectiveFps(props)
 	local answer = LrDialogs.confirm(
 		LOC "$$$/Timelapse/Done/Title=Timelapse created",
 		LOC("$$$/Timelapse/Done/Detail=^1^n^2 frames, ^3 seconds", outputPath,
@@ -225,11 +232,18 @@ function TimelapseDialog.show(context, args)
 	local photos = args.photos
 	local props = LrBinding.makePropertyTable(context)
 
+	-- Runs regardless of how the dialog is dismissed (Cancel, validation
+	-- errors handled below, or a completed/failed generation).
+	context:addCleanupHandler(function()
+		PreviewBuilder.cleanup()
+	end)
+
 	-- Defaults (possibly overridden by saved preferences).
 	props.resolution = '1080p'
 	props.orientation = 'landscape'
 	props.fit = 'crop'
 	props.fps = 30
+	props.customFps = 30
 	props.codec = 'h264'
 	props.qualityPreset = 'medium'
 	props.showAdvanced = false
@@ -242,12 +256,21 @@ function TimelapseDialog.show(context, args)
 	props.fileName = 'timelapse_' .. os.date('%Y%m%d_%H%M%S')
 	props.previewRunning = false
 
-	-- ffmpeg detection.
-	local ffmpegPath, ffmpegVersion = FFmpegLocator.locate()
+	-- ffmpeg detection. The path itself is now configured in Lightroom's
+	-- Plug-in Manager (see PluginInfoProvider.lua); this dialog only shows
+	-- a read-only status.
+	local ffmpegPath, ffmpegVersion, ffmpegSufficient = FFmpegLocator.locate()
 	props.ffmpegPath = ffmpegPath
-	props.ffmpegStatus = ffmpegPath
-		and LOC("$$$/Timelapse/FFmpeg/Found=ffmpeg ^1 — ^2", ffmpegVersion, ffmpegPath)
-		or LOC "$$$/Timelapse/FFmpeg/Missing=ffmpeg not found. Install it (e.g. 'brew install ffmpeg') or set its path."
+	props.ffmpegVersionInsufficient = (ffmpegPath ~= nil and not ffmpegSufficient)
+	if ffmpegPath then
+		props.ffmpegStatus = LOC("$$$/Timelapse/FFmpeg/Found=ffmpeg ^1 — ^2", ffmpegVersion, ffmpegPath)
+		props.ffmpegWarningText = LOC(
+			"$$$/Timelapse/FFmpeg/TooOld=ffmpeg ^1 detected — version ^2 or newer is recommended; some features (e.g. deflicker) may not work.",
+			ffmpegVersion, FFmpegCommand.MIN_FFMPEG_VERSION)
+	else
+		props.ffmpegStatus = LOC "$$$/Timelapse/FFmpeg/Missing=ffmpeg not found. Configure it in Lightroom's Plug-in Manager (File > Plug-in Manager > Timelapse Creator)."
+		props.ffmpegWarningText = ''
+	end
 
 	-- Advanced fields follow the quality preset until edited by hand.
 	local autoKeyint = {}
@@ -257,7 +280,7 @@ function TimelapseDialog.show(context, args)
 		props.encoderPreset = q.preset
 	end
 	local function applyKeyintDefaults()
-		local fps = tonumber(props.fps) or 30
+		local fps = math.floor(effectiveFps(props) + 0.5)
 		if props.keyintMin == nil or props.keyintMin == autoKeyint.min then
 			props.keyintMin = fps
 			autoKeyint.min = fps
@@ -272,7 +295,7 @@ function TimelapseDialog.show(context, args)
 
 	local function updateSummary()
 		local w, h = targetDims(props)
-		local fps = tonumber(props.fps) or 30
+		local fps = effectiveFps(props)
 		props.summaryText = LOC("$$$/Timelapse/Summary=^1 photos  ->  ^2 x ^3 @ ^4 fps  ->  ^5 seconds",
 			#photos, w, h, fps, string.format('%.1f', #photos / fps))
 	end
@@ -281,6 +304,12 @@ function TimelapseDialog.show(context, args)
 	props:addObserver('fps', function()
 		updateSummary()
 		applyKeyintDefaults()
+	end)
+	props:addObserver('customFps', function()
+		if props.fps == 'custom' then
+			updateSummary()
+			applyKeyintDefaults()
+		end
 	end)
 	props:addObserver('resolution', updateSummary)
 	props:addObserver('orientation', updateSummary)
@@ -299,6 +328,7 @@ function TimelapseDialog.show(context, args)
 	for _, v in ipairs(FPS_VALUES) do
 		fpsItems[#fpsItems + 1] = { title = tostring(v) .. ' fps', value = v }
 	end
+	fpsItems[#fpsItems + 1] = { title = LOC "$$$/Timelapse/UI/FpsCustom=Custom...", value = 'custom' }
 	for _, r in ipairs(RESOLUTIONS) do
 		resItems[#resItems + 1] = { title = r.title, value = r.value }
 	end
@@ -339,6 +369,17 @@ function TimelapseDialog.show(context, args)
 			spacing = f:label_spacing(),
 			f:static_text { title = LOC "$$$/Timelapse/UI/Speed=Frame rate:", width = LrView.share 'label' },
 			f:popup_menu { value = bind 'fps', items = fpsItems },
+			f:edit_field {
+				value = bind 'customFps',
+				min = 1, max = 240, precision = 3, width_in_digits = 7,
+				visible = LrView.bind {
+					keys = { 'fps' },
+					operation = function(_, values, fromTable)
+						if fromTable then return values.fps == 'custom' end
+						return LrBinding.kUnsupportedDirection
+					end,
+				},
+			},
 			f:static_text { title = LOC "$$$/Timelapse/UI/SpeedNote=1 photo = 1 frame" },
 		},
 
@@ -470,7 +511,7 @@ function TimelapseDialog.show(context, args)
 								targetW = targetW,
 								targetH = targetH,
 								shortSide = tonumber(props.previewRes) or 480,
-								fps = tonumber(props.fps) or 30,
+								fps = effectiveFps(props),
 								fit = props.fit,
 								deflicker = props.deflicker,
 								deflickerSize = tonumber(props.deflickerSize),
@@ -501,34 +542,12 @@ function TimelapseDialog.show(context, args)
 
 		f:separator { fill_horizontal = 1 },
 		f:static_text { title = bind 'ffmpegStatus', truncation = 'middle', fill_horizontal = 1, width_in_chars = 55 },
-		f:push_button {
-			title = LOC "$$$/Timelapse/UI/SetFFmpeg=Set ffmpeg path...",
-			action = function()
-				local files = LrDialogs.runOpenPanel {
-					title = LOC "$$$/Timelapse/UI/ChooseFFmpeg=Locate the ffmpeg binary",
-					canChooseFiles = true,
-					canChooseDirectories = false,
-					allowsMultipleSelection = false,
-					showHidden = true,
-				}
-				if files and files[1] then
-					-- Button actions run on the main UI task; FFmpegLocator.validate
-					-- yields (it shells out via LrTasks.execute), so it must run
-					-- inside its own task.
-					LrTasks.startAsyncTask(function()
-						local version = FFmpegLocator.validate(files[1])
-						if version then
-							FFmpegLocator.saveUserPath(files[1])
-							props.ffmpegPath = files[1]
-							props.ffmpegStatus = LOC("$$$/Timelapse/FFmpeg/Found=ffmpeg ^1 — ^2", version, files[1])
-						else
-							LrDialogs.message(
-								LOC "$$$/Timelapse/FFmpeg/Invalid=This file does not look like a working ffmpeg binary.",
-								files[1], 'warning')
-						end
-					end, 'TimelapseCreator ffmpeg validation')
-				end
-			end,
+		f:static_text {
+			title = bind 'ffmpegWarningText',
+			visible = bind 'ffmpegVersionInsufficient',
+			fill_horizontal = 1,
+			width_in_chars = 55,
+			height_in_lines = 2,
 		},
 	}
 	end
@@ -546,6 +565,9 @@ function TimelapseDialog.show(context, args)
 		-- Validation; on failure the dialog is shown again.
 		if not props.ffmpegPath then
 			LrDialogs.message(props.ffmpegStatus, nil, 'warning')
+		elseif props.fps == 'custom' and not (tonumber(props.customFps) and tonumber(props.customFps) > 0
+			and tonumber(props.customFps) <= 240) then
+			LrDialogs.message(LOC "$$$/Timelapse/Error/BadFps=Please enter a valid custom frame rate (0-240 fps).", nil, 'warning')
 		elseif not props.outputFolder or LrFileUtils.exists(props.outputFolder) ~= 'directory' then
 			LrDialogs.message(LOC "$$$/Timelapse/Error/BadFolder=Please choose a valid output folder.", nil, 'warning')
 		elseif tonumber(props.keyintMin) and tonumber(props.keyintMax)

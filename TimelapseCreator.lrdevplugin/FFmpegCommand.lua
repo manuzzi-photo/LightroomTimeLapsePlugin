@@ -260,4 +260,39 @@ function FFmpegCommand.previewDimensions(targetW, targetH, shortSide)
 	return FFmpegCommand.evenDim(targetW * scale), FFmpegCommand.evenDim(targetH * scale)
 end
 
+--------------------------------------------------------------------------------
+-- Version requirements
+--------------------------------------------------------------------------------
+
+-- The newest feature this plugin depends on is the `deflicker` filter
+-- (ffmpeg 3.4, 2017); everything else (libx265, hvc1 tagging, faststart,
+-- BT.709/BT.2020 color tags) is much older. 4.0 adds a safety margin while
+-- staying trivially available on any current package manager.
+FFmpegCommand.MIN_FFMPEG_VERSION = '4.0'
+
+-- Extracts numeric dot-separated components from a version string, ignoring
+-- any leading/trailing non-digit metadata (e.g. "n4.4-20220222" -> {4, 4},
+-- "6.1.1" -> {6, 1, 1}).
+local function versionComponents(version)
+	local components = {}
+	for num in tostring(version):gmatch('%d+') do
+		components[#components + 1] = tonumber(num)
+	end
+	return components
+end
+
+-- Compares two dot-separated version strings numerically component by
+-- component. Returns true if `version` >= `minVersion`. A version that
+-- cannot be parsed at all is treated as insufficient (returns false).
+function FFmpegCommand.isVersionAtLeast(version, minVersion)
+	local v = versionComponents(version)
+	local m = versionComponents(minVersion)
+	if #v == 0 then return false end
+	for i = 1, math.max(#v, #m) do
+		local vc, mc = v[i] or 0, m[i] or 0
+		if vc ~= mc then return vc > mc end
+	end
+	return true
+end
+
 return FFmpegCommand

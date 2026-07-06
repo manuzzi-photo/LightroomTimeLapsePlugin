@@ -18,6 +18,24 @@ local PreviewBuilder = {}
 
 local THUMBNAIL_TIMEOUT = 15 -- seconds per photo
 
+-- Only one preview is ever "current"; the previous one's scratch folder
+-- (frame JPEGs + preview.mp4, in the system temp directory) is no longer
+-- needed once a new one is requested.
+local lastPreviewDir = nil
+
+-- Deletes the last preview's scratch folder, if any. Safe to call even
+-- while the previous preview.mp4 is still open in the system video player
+-- (deleting an open file just unlinks it; the player keeps playing).
+-- Called before building a new preview, and when the creation dialog closes
+-- (see TimelapseDialog.lua) and when Lightroom quits (see ShutdownApp.lua,
+-- which instead wipes the whole temp root in case this was never reached).
+function PreviewBuilder.cleanup()
+	if lastPreviewDir and LrFileUtils.exists(lastPreviewDir) then
+		LrFileUtils.delete(lastPreviewDir)
+	end
+	lastPreviewDir = nil
+end
+
 -- opts:
 --   photos        (array of LrPhoto, sorted)
 --   targetW/H     (number)  final video dimensions (for the aspect)
@@ -32,10 +50,13 @@ local THUMBNAIL_TIMEOUT = 15 -- seconds per photo
 -- Must be called from an async task.
 -- Returns ok (boolean), outputPathOrMessage (string).
 function PreviewBuilder.build(opts)
+	PreviewBuilder.cleanup()
+
 	local pw, ph = FFmpegCommand.previewDimensions(opts.targetW, opts.targetH, opts.shortSide)
 	local dir = LrPathUtils.child(opts.tempRoot,
 		string.format('preview_%d', os.time()))
 	LrFileUtils.createAllDirectories(dir)
+	lastPreviewDir = dir
 
 	local count = 0
 	for i = 1, #opts.photos do

@@ -23,8 +23,10 @@ local LrShell = import 'LrShell'
 local LrSystemInfo = import 'LrSystemInfo'
 local LrTasks = import 'LrTasks'
 
+local FFmpegCommand = require 'FFmpegCommand'
 local FFmpegLocator = require 'FFmpegLocator'
 local Platform = require 'Platform'
+local Version = require 'Version'
 local Log = require 'Log'
 
 --------------------------------------------------------------------------------
@@ -106,20 +108,22 @@ end
 LrTasks.startAsyncTask(function()
 	LrFunctionContext.callWithContext('TimelapseDiagnostics', function()
 		report = {}
-		line('Timelapse Creator diagnostics — %s', os.date())
+		line('Timelapse Creator %s diagnostics — %s', Version.display, os.date())
 
 		section('Environment')
+		line('Plugin version: %s', Version.display)
 		line('Lightroom: %s', LrApplication.versionString())
 		local okSys, sysInfo = pcall(LrSystemInfo.summaryString)
 		if okSys then line('System: %s', sysInfo) end
 		line('Platform: %s', Platform.isWindows and 'Windows' or 'macOS')
 
 		section('ffmpeg detection')
-		local ffmpegPath, ffmpegVersion = FFmpegLocator.locate()
+		local ffmpegPath, ffmpegVersion, ffmpegSufficient = FFmpegLocator.locate()
 		if ffmpegPath then
-			line('Found: %s (version %s)', ffmpegPath, ffmpegVersion)
+			line('Found: %s (version %s, minimum %s: %s)', ffmpegPath, ffmpegVersion,
+				FFmpegCommand.MIN_FFMPEG_VERSION, ffmpegSufficient and 'OK' or 'TOO OLD')
 		else
-			line('NOT FOUND. Install ffmpeg (macOS: brew install ffmpeg) or set the path in the plug-in dialog.')
+			line('NOT FOUND. Install ffmpeg (macOS: brew install ffmpeg) or set the path in Plug-in Manager.')
 		end
 
 		section('LrTasks.execute semantics')

@@ -6,6 +6,10 @@ Copyright (C) 2026 Marco Manuzzi
 Licensed under the GNU General Public License v3; see LICENSE.
 ------------------------------------------------------------------------------]]
 
+-- NOTE: Info.lua is parsed in a restricted environment where `require` does
+-- not exist (confirmed by Lightroom's plug-in load error when it was used
+-- here), so the version cannot be shared with Version.lua via require. Keep
+-- this VERSION table in sync with Version.lua by hand when bumping.
 return {
 
 	LrSdkVersion = 13.0,
@@ -14,6 +18,13 @@ return {
 	LrToolkitIdentifier = 'com.marcomanuzzi.lightroom.timelapsecreator',
 	LrPluginName = LOC "$$$/Timelapse/PluginName=Timelapse Creator",
 	LrPluginInfoUrl = 'https://github.com/manuzzi-photo/LightroomTimeLapsePlugin',
+
+	-- Plug-in Manager section: ffmpeg path configuration and version status.
+	LrPluginInfoProvider = 'PluginInfoProvider.lua',
+
+	-- Clears the temp work folder (previews, leftover failed-generation
+	-- sessions) when Lightroom quits.
+	LrShutdownApp = 'ShutdownApp.lua',
 
 	LrExportMenuItems = {
 		{
@@ -43,5 +54,5 @@ return {
 		id = 'timelapseSettingsDump',
 	},
 
-	VERSION = { major = 0, minor = 1, revision = 0, build = 0, display = '0.1.0' },
+	VERSION = { major = 0, minor = 2, revision = 0, build = 0, display = '0.2.0' },
 }

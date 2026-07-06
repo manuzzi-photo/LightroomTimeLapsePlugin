@@ -8,9 +8,16 @@ local LrPathUtils = import 'LrPathUtils'
 local LrPrefs = import 'LrPrefs'
 
 local Platform = require 'Platform'
+local FFmpegCommand = require 'FFmpegCommand'
 local Log = require 'Log'
 
 local FFmpegLocator = {}
+
+-- True when `version` meets FFmpegCommand.MIN_FFMPEG_VERSION. `version` may
+-- be nil (e.g. ffmpeg not found), in which case this returns false.
+function FFmpegLocator.isSufficient(version)
+	return version ~= nil and FFmpegCommand.isVersionAtLeast(version, FFmpegCommand.MIN_FFMPEG_VERSION)
+end
 
 local function tempChild(name)
 	return LrPathUtils.child(LrPathUtils.getStandardFilePath('temp'), name)
@@ -29,14 +36,16 @@ function FFmpegLocator.validate(path)
 	return content:match('ffmpeg version%s+(%S+)')
 end
 
--- Returns path, version — or nil, nil when ffmpeg cannot be found.
+-- Returns path, version, sufficient — or nil, nil, false when ffmpeg cannot
+-- be found. `sufficient` is false when the detected version is older than
+-- FFmpegCommand.MIN_FFMPEG_VERSION (informational only, not a hard block).
 function FFmpegLocator.locate()
 	local prefs = LrPrefs.prefsForPlugin()
 
 	if prefs.ffmpegPath and prefs.ffmpegPath ~= '' then
 		local version = FFmpegLocator.validate(prefs.ffmpegPath)
 		if version then
-			return prefs.ffmpegPath, version
+			return prefs.ffmpegPath, version, FFmpegLocator.isSufficient(version)
 		end
 		Log:warn('Saved ffmpeg path is no longer valid: ' .. tostring(prefs.ffmpegPath))
 	end
@@ -45,7 +54,7 @@ function FFmpegLocator.locate()
 		if LrFileUtils.exists(candidate) then
 			local version = FFmpegLocator.validate(candidate)
 			if version then
-				return candidate, version
+				return candidate, version, FFmpegLocator.isSufficient(version)
 			end
 		end
 	end
@@ -61,11 +70,11 @@ function FFmpegLocator.locate()
 	if found and found ~= '' then
 		local version = FFmpegLocator.validate(found)
 		if version then
-			return found, version
+			return found, version, FFmpegLocator.isSufficient(version)
 		end
 	end
 
-	return nil, nil
+	return nil, nil, false
 end
 
 function FFmpegLocator.saveUserPath(path)

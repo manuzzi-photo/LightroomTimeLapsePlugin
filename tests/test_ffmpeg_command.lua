@@ -148,6 +148,21 @@ for _, name in ipairs{ 'high', 'medium', 'low' } do
 end
 check('preset fallback', C.resolveQualityPreset('bogus', 'h264').crf == 21)
 
+------------------------------------------------------------- isVersionAtLeast
+
+check('min version constant', C.MIN_FFMPEG_VERSION == '4.0')
+
+check('newer major sufficient', C.isVersionAtLeast('8.0.1', '4.0') == true)
+check('exact match sufficient', C.isVersionAtLeast('4.0', '4.0') == true)
+check('newer patch sufficient', C.isVersionAtLeast('4.0.5', '4.0') == true)
+check('older major insufficient', C.isVersionAtLeast('3.2', '4.0') == false)
+check('older minor insufficient', C.isVersionAtLeast('3.4.11', '4.0') == false)
+check('distro suffix sufficient', C.isVersionAtLeast('4.4.1-0ubuntu1', '4.0') == true)
+check('distro suffix insufficient', C.isVersionAtLeast('3.4.8-0ubuntu1', '4.0') == false)
+check('leading n prefix', C.isVersionAtLeast('n4.4', '4.0') == true)
+check('unparseable version', C.isVersionAtLeast('unknown', '4.0') == false)
+check('nil version', C.isVersionAtLeast(nil, '4.0') == false)
+
 --------------------------------------------------------------------- result
 
 print(string.rep('-', 40))

@@ -145,6 +145,164 @@ Fatto: localizzazione IT, README, gestione "ffmpeg non trovato" con
 selezione percorso. Mancano: CI GitHub Actions (unit test + luacheck),
 packaging `.lrplugin` di release, test e rifinitura Windows.
 
+## Versione 0.2.0 — ✅ implementata (2026-07-06)
+
+Quattro modifiche mirate sulla base ​0.1.0, nessuna delle quali tocca la pipeline
+di generazione video (che resta quella già testata). Implementate come
+pianificato, con un quinto punto aggiunto in corso d'opera (pulizia delle
+cartelle di anteprima).
+
+### 1. Percorso ffmpeg spostato nelle impostazioni del plugin — ✅ implementato
+
+Oggi il pulsante "Imposta percorso ffmpeg..." vive nel dialog di creazione
+(`TimelapseDialog.lua`), che è per-video; il percorso ffmpeg è invece
+un'impostazione di installazione e appartiene al **Gestione plug-in** di
+Lightroom, tramite `LrPluginInfoProvider`.
+
+- **Info.lua**: aggiungere `LrPluginInfoProvider = 'PluginInfoProvider.lua'`.
+- **Nuovo file `PluginInfoProvider.lua`**:
+  - `startDialog(propertyTable)` — chiamata *bloccante* da Lightroom quando il
+    plugin viene selezionato in Gestione plug-in (non è un task). Deve quindi
+    leggere solo `LrPrefs` in modo sincrono per popolare `propertyTable`
+    subito, poi lanciare `LrTasks.startAsyncTask` per rivalidare ffmpeg
+    (`FFmpegLocator.locate()`, che shella fuori e quindi deve yieldare) e
+    aggiornare `propertyTable.ffmpegStatus` quando pronto. Stesso bug-pattern
+    già corretto altrove (pcall/yield) — va evitato fin dal progetto.
+  - `sectionsForTopOfDialog(f, propertyTable)` — ritorna una sezione con:
+    logo (vedi punto 2), nome e versione del plugin, riga di stato ffmpeg
+    (percorso + versione rilevata), pulsanti **"Rileva automaticamente"** e
+    **"Scegli percorso..."** (logica riusata da `FFmpegLocator`), e la nota
+    sulla versione minima richiesta (vedi punto 4).
+- **TimelapseDialog.lua**: rimuovere il pulsante e l'azione di scelta percorso;
+  mantenere solo una riga di stato **in sola lettura** (`bind 'ffmpegStatus'`);
+  se ffmpeg non è configurato, il testo rimanda a *File → Gestione plug-in →
+  Timelapse Creator*. La validazione che blocca "Crea timelapse" senza ffmpeg
+  resta invariata.
+- Nessuna migrazione dati necessaria: la preferenza `ffmpegPath` è già in
+  `LrPrefs.prefsForPlugin()`, letta/scritta dagli stessi metodi di
+  `FFmpegLocator` (`locate`, `validate`, `saveUserPath`).
+
+### 2. Logo nelle impostazioni del plugin e nel README — ✅ implementato
+
+File sorgente già presente in repo: `Logo.png` (1254×1254, RGBA), che resta
+in root come master per la documentazione.
+
+- Il controllo `LrView` `picture` richiede un file **PNG/JPG dentro la
+  cartella del plugin**, referenziato con `_PLUGIN:resourceId('Icon.png')`
+  (i path assoluti fuori dal bundle non sono garantiti). Va quindi generata
+  una copia ridimensionata: `TimelapseCreator.lrdevplugin/Icon.png`, 128×128,
+  con `sips -Z 128 Logo.png --out TimelapseCreator.lrdevplugin/Icon.png`
+  (strumento già presente su macOS, nessuna nuova dipendenza).
+- `PluginInfoProvider.lua`: `f:picture { value = _PLUGIN:resourceId('Icon.png'), frame_width = 0 }`
+  in cima alla sezione, accanto a nome/versione.
+- `README.md`: banner in testa al file,
+  `<p align="center"><img src="Logo.png" width="180" alt="Timelapse Creator"></p>`,
+  usando l'asset master a piena risoluzione (GitHub lo scala via l'attributo `width`).
+
+### 3. Frequenza fotogrammi "personalizzata" — ✅ implementato
+
+- `TimelapseDialog.lua`, popup fps: aggiungere la voce
+  `{ title = LOC "…Custom=Personalizzato...", value = 'custom' }` in coda a
+  24/25/30/60.
+- Nuovo campo `props.customFps` (default: `30`), con un `f:edit_field`
+  (`min = 1, max = 240, precision = 3` per coprire framerate frazionari tipo
+  23.976/29.97) visibile solo quando `props.fps == 'custom'`, tramite binding
+  calcolato:
+  ```lua
+  visible = LrView.bind {
+    keys = { 'fps' },
+    operation = function(_, values, fromTable)
+      if fromTable then return values.fps == 'custom' end
+      return LrBinding.kUnsupportedDirection
+    end,
+  }
+  ```
+- **Centralizzare la risoluzione del valore effettivo** in un helper
+  `effectiveFps(props)` (`return props.fps == 'custom' and tonumber(props.customFps) or tonumber(props.fps) or 30`),
+  usato ovunque oggi si legge `tonumber(props.fps)`: `updateSummary`,
+  `applyKeyintDefaults`, `runGeneration` (chiamata a `FFmpegRunner.run`) e il
+  builder della preview. Evita di duplicare la stessa logica in quattro punti.
+- Validazione nel loop del dialog: se `props.fps == 'custom'`, richiedere
+  `tonumber(props.customFps)` in `(0, 240]`, altrimenti messaggio di errore
+  come per gli altri campi.
+- `customFps` aggiunto alla lista `REMEMBERED` per persistenza tra sessioni.
+
+### 4. Versione minima di ffmpeg — ✅ implementato
+
+Verificata la feature più recente da cui il plugin dipende: il filtro
+`deflicker` è stato introdotto in **ffmpeg 3.4** (2017); tutte le altre
+funzionalità usate (libx265, tag `hvc1`, `movflags +faststart`, tag colore
+BT.709/BT.2020) sono molto più datate. Il plugin è sviluppato e testato con
+ffmpeg 8.0.1.
+
+- **Minimo dichiarato: ffmpeg 4.0** (margine di sicurezza sopra la soglia
+  reale di 3.4, versione facilmente reperibile su qualunque gestore pacchetti
+  attuale).
+- **`FFmpegCommand.lua`** (Lua puro, testabile): aggiungere
+  `FFmpegCommand.MIN_FFMPEG_VERSION = '4.0'` e una funzione pura
+  `FFmpegCommand.isVersionAtLeast(version, minVersion)` che confronta i
+  componenti numerici (`major.minor.patch`) di due stringhe di versione;
+  unit-testata come le altre funzioni pure del modulo (inclusi casi limite
+  tipo `"n4.4-20220..."` o `"6.1.1"`).
+- **`FFmpegLocator.lua`**: `locate()`/`validate()` restituiscono anche
+  `sufficient` (booleano) accanto a path/versione.
+- **UI** (main dialog in sola lettura + sezione Gestione plug-in): se ffmpeg è
+  rilevato ma `sufficient == false`, mostrare un avviso non bloccante,
+  es. *"ffmpeg 3.2 rilevato — richiesta versione 4.0 o superiore; funzioni
+  come il deflicker potrebbero non essere disponibili."* La generazione non
+  viene bloccata (ffmpeg resta generalmente retrocompatibile a livello di
+  sintassi; è un avviso, non un hard gate).
+- **README.md**: aggiornare i Requirements con
+  "ffmpeg ≥ 4.0 (sviluppato e testato con la 8.0.1; versioni precedenti
+  potrebbero non avere il filtro `deflicker`)".
+
+### 5. Pulizia delle cartelle di anteprima (richiesta aggiunta in corso d'opera)
+
+La preview era già generata sotto la cartella temporanea di sistema
+(`LrPathUtils.getStandardFilePath('temp')/TimelapseCreator/preview_<timestamp>`),
+ma non veniva mai ripulita. Aggiunta pulizia a due livelli:
+
+- **`PreviewBuilder.lua`**: tiene traccia dell'ultima cartella di anteprima
+  generata (`lastPreviewDir`) e la elimina — via `PreviewBuilder.cleanup()` —
+  sia all'inizio di ogni nuova generazione, sia quando il chiamante lo
+  richiede esplicitamente. Sicuro anche se il video è ancora aperto nel
+  player di sistema (su macOS l'unlink di un file aperto non lo interrompe).
+- **`TimelapseDialog.lua`**: registra `context:addCleanupHandler(...)` che
+  chiama `PreviewBuilder.cleanup()` — eseguito automaticamente qualunque sia
+  il modo in cui il dialog si chiude (Annulla, errore di validazione,
+  generazione completata o fallita). Questa è la pulizia "alla chiusura del
+  tool".
+- **Nuovo `ShutdownApp.lua`** + `Info.lua`: `LrShutdownApp` cancella l'intera
+  cartella `<temp di sistema>/TimelapseCreator` alla chiusura di Lightroom —
+  rete di sicurezza per il caso in cui il cleanup handler del dialog non sia
+  mai scattato (Lightroom terminato in modo anomalo), e ripulisce anche le
+  cartelle di sessione di generazioni fallite lasciate apposta per debug
+  (vedi Fase 2).
+
+### File coinvolti (riepilogo)
+
+```
+TimelapseCreator.lrdevplugin/
+├── Info.lua                  -- + LrPluginInfoProvider, + LrShutdownApp
+├── PluginInfoProvider.lua    -- NUOVO: sezione Gestione plug-in (ffmpeg, logo, versione min)
+├── ShutdownApp.lua           -- NUOVO: pulizia cartella temp alla chiusura di Lightroom
+├── Icon.png                  -- NUOVO: logo ridimensionato 128×128 (da Logo.png in root)
+├── TimelapseDialog.lua       -- rimosso pulsante percorso ffmpeg; + fps personalizzato; + effectiveFps();
+│                                + cleanup handler per le preview
+├── PreviewBuilder.lua        -- + tracking e pulizia dell'ultima cartella di anteprima
+├── FFmpegCommand.lua         -- + MIN_FFMPEG_VERSION, isVersionAtLeast()
+├── FFmpegLocator.lua         -- locate()/validate() restituiscono anche `sufficient`
+├── DiagnosticsMenuItem.lua   -- mostra anche l'esito del controllo versione minima
+└── TranslatedStrings_it.txt  -- + nuove stringhe (personalizzato, avviso versione, Gestione plug-in)
+
+tests/test_ffmpeg_command.lua -- + casi per isVersionAtLeast()
+README.md                     -- + banner logo, + requisito versione ffmpeg
+```
+
+Nessun impatto sulla pipeline export→ffmpeg né sui test di integrazione
+esistenti (`integration_ffmpeg.sh`); tutti i 55 unit test e i 4 encode di
+integrazione continuano a passare dopo le modifiche.
+
 ## Rischi e punti aperti
 
 1. **Export HDR via SDK** *(rischio principale)* — l'SDK potrebbe non esporre i formati
