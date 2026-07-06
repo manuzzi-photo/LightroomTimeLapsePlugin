@@ -75,7 +75,24 @@ lua tests/test_ffmpeg_command.lua
 
 # integration test: real encodes with synthetic frames (needs ffmpeg)
 sh tests/integration_ffmpeg.sh
+
+# check that Info.lua and Version.lua declare the same version
+# (they can't share code — Info.lua runs where `require` isn't available)
+lua scripts/check_version.lua
 ```
+
+### Releasing
+
+1. Bump the version by hand in **both** `TimelapseCreator.lrdevplugin/Info.lua`
+   (`VERSION.display`) and `TimelapseCreator.lrdevplugin/Version.lua`
+   (`display`) — `lua scripts/check_version.lua` confirms they match.
+2. Commit, then tag: `git tag -a vX.Y.Z -m "..."`.
+3. Run `sh scripts/release.sh vX.Y.Z`. It verifies the tag matches the code
+   version, runs the syntax check and unit tests, packages
+   `TimelapseCreator.lrplugin` (renamed from the dev copy) together with
+   `README.md` and `LICENSE` into a zip under `dist/`, then — after you
+   confirm — pushes the tag and publishes a GitHub release with the zip
+   attached (`gh` CLI required).
 
 See [PLAN.md](PLAN.md) for the full design and roadmap.
 

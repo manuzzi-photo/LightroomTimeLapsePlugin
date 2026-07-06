@@ -142,8 +142,36 @@ espone nulla: TIFF 16-bit + conversione con `zscale`, oppure HDR rimandato.
 
 ### Fase 5 — Rifinitura open source — 🔄 parziale
 Fatto: localizzazione IT, README, gestione "ffmpeg non trovato" con
-selezione percorso. Mancano: CI GitHub Actions (unit test + luacheck),
-packaging `.lrplugin` di release, test e rifinitura Windows.
+selezione percorso, workflow di rilascio manuale (`scripts/release.sh`,
+vedi sotto). Mancano: CI GitHub Actions (unit test + luacheck su ogni push),
+test e rifinitura Windows.
+
+## Workflow di rilascio — ✅ implementato (2026-07-06)
+
+Rilascio manuale, non automatico su push del tag (scelta esplicita:
+mantenere il controllo diretto invece di una pipeline CI). Copertura dei tre
+passi richiesti:
+
+1. **Compilazione/pacchettizzazione**: `scripts/release.sh` copia
+   `TimelapseCreator.lrdevplugin/` in `dist/TimelapseCreator.lrplugin/`
+   (rinominata secondo la convenzione SDK per la distribuzione), aggiunge
+   `README.md` e `LICENSE`, e crea `dist/TimelapseCreator-X.Y.Z.zip`. Prima
+   di pacchettizzare esegue `luac -p` su tutti i file e la suite di unit
+   test (`tests/test_ffmpeg_command.lua`).
+2. **Verifica versione**: `scripts/check_version.lua` — dato che `Info.lua`
+   non può fare `require` (vedi Fase 0/bug fix), la sua `VERSION.display` è
+   estratta per pattern-matching testuale e confrontata sia con
+   `Version.lua` sia con il tag passato come argomento. Fallisce (`exit 1`)
+   su qualunque disallineamento; richiamabile anche da solo durante lo
+   sviluppo, senza rilasciare nulla.
+3. **Release GitHub**: dopo conferma interattiva, `release.sh` pusha il tag
+   su `origin` (se non già presente) e usa `gh release create <tag> <zip>
+   --generate-notes` per pubblicare, allegando lo zip compilato.
+
+Precondizioni verificate dallo script prima di procedere: il tag richiesto
+deve esistere già localmente (creato a mano con `git tag -a`) e puntare
+esattamente su HEAD, e il working tree deve essere pulito — tagging resta
+un passo distinto e deliberato, non automatizzato dallo script.
 
 ## Versione 0.2.0 — ✅ implementata (2026-07-06)
 
