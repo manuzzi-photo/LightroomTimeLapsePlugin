@@ -54,5 +54,5 @@ return {
 		id = 'timelapseSettingsDump',
 	},
 
-	VERSION = { major = 0, minor = 2, revision = 0, build = 0, display = '0.2.0' },
+	VERSION = { major = 0, minor = 3, revision = 0, build = 0, display = '0.3.0' },
 }

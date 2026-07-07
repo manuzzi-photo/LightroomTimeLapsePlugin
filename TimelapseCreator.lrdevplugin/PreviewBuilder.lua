@@ -103,7 +103,7 @@ function PreviewBuilder.build(opts)
 
 	local outputPath = LrPathUtils.child(dir, 'preview.mp4')
 	local logFile = LrPathUtils.child(dir, 'ffmpeg.log')
-	local ok, status, tail = FFmpegRunner.run({
+	local outcome, _, tail = FFmpegRunner.run({
 		ffmpegPath = opts.ffmpegPath,
 		inputPattern = LrPathUtils.child(dir, 'frame_%06d.jpg'),
 		fps = opts.fps,
@@ -116,10 +116,13 @@ function PreviewBuilder.build(opts)
 		deflicker = opts.deflicker,
 		deflickerSize = opts.deflickerSize,
 		outputPath = outputPath,
-	}, { logFile = logFile })
+	}, { logFile = logFile, progressScope = opts.progressScope })
 
-	if not ok then
-		return false, (tail and tail ~= '' and tail) or ('ffmpeg exit ' .. tostring(status))
+	if outcome == 'canceled' then
+		return false, 'canceled'
+	end
+	if outcome ~= 'ok' then
+		return false, (tail and tail ~= '' and tail) or 'ffmpeg failed'
 	end
 	return true, outputPath
 end

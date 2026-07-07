@@ -54,75 +54,87 @@ function PluginInfoProvider.sectionsForTopOfDialog(f, propertyTable)
 		{
 			title = LOC "$$$/Timelapse/PluginInfo/Title=Timelapse Creator",
 
-			f:row {
+			-- bind_to_object is required here: unlike TimelapseDialog's own
+			-- modal (which sets it on its root view), sections contributed
+			-- to the Plug-in Manager do NOT automatically bind to
+			-- propertyTable — without this, `bind 'ffmpegStatus'` silently
+			-- never updates (confirmed: the version text stayed blank even
+			-- though propertyTable.ffmpegStatus was being set correctly).
+			f:column {
+				bind_to_object = propertyTable,
 				spacing = f:control_spacing(),
-				f:picture { value = _PLUGIN:resourceId('Icon.png') },
-				f:column {
+				fill_horizontal = 1,
+
+				f:row {
 					spacing = f:control_spacing(),
-					f:static_text {
-						title = LOC "$$$/Timelapse/PluginInfo/Name=Timelapse Creator",
-						font = '<system/bold>',
-					},
-					f:static_text {
-						title = LOC(
-							"$$$/Timelapse/PluginInfo/MinFfmpeg=Requires ffmpeg ^1 or newer.",
-							FFmpegCommand.MIN_FFMPEG_VERSION),
+					f:picture { value = _PLUGIN:resourceId('Icon.png') },
+					f:column {
+						spacing = f:control_spacing(),
+						f:static_text {
+							title = LOC "$$$/Timelapse/PluginInfo/Name=Timelapse Creator",
+							font = '<system/bold>',
+						},
+						f:static_text {
+							title = LOC(
+								"$$$/Timelapse/PluginInfo/MinFfmpeg=Requires ffmpeg ^1 or newer.",
+								FFmpegCommand.MIN_FFMPEG_VERSION),
+						},
 					},
 				},
-			},
 
-			f:separator { fill_horizontal = 1 },
+				f:separator { fill_horizontal = 1 },
 
-			f:static_text {
-				title = bind 'ffmpegStatus',
-				truncation = 'middle',
-				fill_horizontal = 1,
-				width_in_chars = 50,
-			},
-			f:static_text {
-				title = bind 'ffmpegWarningText',
-				visible = bind 'ffmpegVersionInsufficient',
-				fill_horizontal = 1,
-				width_in_chars = 50,
-				height_in_lines = 2,
-			},
-
-			f:row {
-				spacing = f:control_spacing(),
-				f:push_button {
-					title = LOC "$$$/Timelapse/UI/DetectFFmpeg=Detect automatically",
-					action = function()
-						FFmpegLocator.saveUserPath(nil)
-						propertyTable.ffmpegStatus = LOC "$$$/Timelapse/FFmpeg/Checking=Checking ffmpeg..."
-						refreshStatus(propertyTable)
-					end,
+				f:static_text {
+					title = bind 'ffmpegStatus',
+					truncation = 'middle',
+					fill_horizontal = 1,
+					width_in_chars = 50,
 				},
-				f:push_button {
-					title = LOC "$$$/Timelapse/UI/SetFFmpeg=Set ffmpeg path...",
-					action = function()
-						local files = LrDialogs.runOpenPanel {
-							title = LOC "$$$/Timelapse/UI/ChooseFFmpeg=Locate the ffmpeg binary",
-							canChooseFiles = true,
-							canChooseDirectories = false,
-							allowsMultipleSelection = false,
-							showHidden = true,
-						}
-						if files and files[1] then
-							-- Button actions run on the main UI task; validate()
-							-- yields (shells out via LrTasks.execute).
-							LrTasks.startAsyncTask(function()
-								local version = FFmpegLocator.validate(files[1])
-								if version then
-									FFmpegLocator.saveUserPath(files[1])
-									refreshStatus(propertyTable)
-								else
-									LrDialogs.message(
-										LOC "$$$/Timelapse/FFmpeg/Invalid=This file does not look like a working ffmpeg binary.",
-										files[1], 'warning')
-								end
-							end, 'TimelapseCreator ffmpeg validation')
-						end
-					end,
+				f:static_text {
+					title = bind 'ffmpegWarningText',
+					visible = bind 'ffmpegVersionInsufficient',
+					fill_horizontal = 1,
+					width_in_chars = 50,
+					height_in_lines = 2,
+				},
+
+				f:row {
+					spacing = f:control_spacing(),
+					f:push_button {
+						title = LOC "$$$/Timelapse/UI/DetectFFmpeg=Detect automatically",
+						action = function()
+							FFmpegLocator.saveUserPath(nil)
+							propertyTable.ffmpegStatus = LOC "$$$/Timelapse/FFmpeg/Checking=Checking ffmpeg..."
+							refreshStatus(propertyTable)
+						end,
+					},
+					f:push_button {
+						title = LOC "$$$/Timelapse/UI/SetFFmpeg=Set ffmpeg path...",
+						action = function()
+							local files = LrDialogs.runOpenPanel {
+								title = LOC "$$$/Timelapse/UI/ChooseFFmpeg=Locate the ffmpeg binary",
+								canChooseFiles = true,
+								canChooseDirectories = false,
+								allowsMultipleSelection = false,
+								showHidden = true,
+							}
+							if files and files[1] then
+								-- Button actions run on the main UI task; validate()
+								-- yields (shells out via LrTasks.execute).
+								LrTasks.startAsyncTask(function()
+									local version = FFmpegLocator.validate(files[1])
+									if version then
+										FFmpegLocator.saveUserPath(files[1])
+										refreshStatus(propertyTable)
+									else
+										LrDialogs.message(
+											LOC "$$$/Timelapse/FFmpeg/Invalid=This file does not look like a working ffmpeg binary.",
+											files[1], 'warning')
+									end
+								end, 'TimelapseCreator ffmpeg validation')
+							end
+						end,
+					},
 				},
 			},
 		},

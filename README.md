@@ -7,7 +7,7 @@ Lightroom Classic, using [ffmpeg](https://ffmpeg.org) as the encoder. The
 develop settings of every photo are applied, so what you graded in Lightroom
 is what ends up in the video.
 
-**Status: 0.2.0 — work in progress.** SDR pipeline complete; HDR output is
+**Status: 0.3.0 — work in progress.** SDR pipeline complete; HDR output is
 under investigation (see *HDR* below).
 
 ## Features
@@ -19,8 +19,12 @@ under investigation (see *HDR* below).
 - Quality presets plus advanced controls: CRF, encoder preset,
   **min/max keyframe interval (GOP)**, max bitrate
 - Optional ffmpeg `deflicker` filter
-- Fast low-resolution preview (480p/240p) built from catalog previews and
-  opened in the system video player
+- Instant frame-by-frame preview (slider + prev/next) showing each photo as
+  developed, plus a fast low-resolution MP4 preview (480p/240p) opened in
+  the system video player
+- Save the video next to the source photos, or in a folder you choose
+- Cancelable export: both the frame render and the ffmpeg encode can be
+  interrupted mid-run
 - UI in English and Italian
 
 ## Requirements
@@ -49,7 +53,8 @@ under investigation (see *HDR* below).
 - Frames are rendered to a temporary folder via the Lightroom export engine
   (full develop settings, correct size for the chosen crop), encoded, then
   the temporary files are removed. Budget disk space for one JPEG per photo.
-- A running ffmpeg encode cannot be canceled from Lightroom yet.
+- The frame-by-frame preview shows each photo as developed (including its
+  own crop, if any) — it does not simulate the video's target crop/fit.
 
 ## HDR
 
@@ -88,11 +93,15 @@ lua scripts/check_version.lua
    (`display`) — `lua scripts/check_version.lua` confirms they match.
 2. Commit, then tag: `git tag -a vX.Y.Z -m "..."`.
 3. Run `sh scripts/release.sh vX.Y.Z`. It verifies the tag matches the code
-   version, runs the syntax check and unit tests, packages
-   `TimelapseCreator.lrplugin` (renamed from the dev copy) together with
-   `README.md` and `LICENSE` into a zip under `dist/`, then — after you
-   confirm — pushes the tag and publishes a GitHub release with the zip
-   attached (`gh` CLI required).
+   version, checks syntax (system Lua and, for release builds, Lightroom's
+   actual Lua 5.1), runs unit tests, compiles every plugin script to Lua 5.1
+   bytecode (except `Info.lua`, kept as source — see the comment in that
+   file) with the compiler bundled in the Lightroom Classic SDK, packages
+   `TimelapseCreator.lrplugin` together with `README.md` and `LICENSE` into
+   a zip under `dist/`, then — after you confirm — pushes the tag and
+   publishes a GitHub release with the zip attached (`gh` CLI required).
+   Requires the Lightroom Classic SDK locally (not part of this repo — see
+   `ADOBE_LUAC` in `scripts/release.sh` if it's not at the default path).
 
 See [PLAN.md](PLAN.md) for the full design and roadmap.
 

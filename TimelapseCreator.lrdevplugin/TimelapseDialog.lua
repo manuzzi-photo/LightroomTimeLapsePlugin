@@ -81,12 +81,24 @@ local function defaultOutputFolder()
 	return LrPathUtils.getStandardFilePath('home')
 end
 
+-- When saveInSourceFolder is on, the video is saved next to the first photo
+-- of the (capture-time-sorted) sequence. If the selection spans several
+-- folders, only that first photo's folder is used — kept deliberately
+-- simple, called out in the UI rather than auto-detected/warned about.
+local function resolveOutputFolder(props, photos)
+	if props.saveInSourceFolder then
+		local firstPath = photos[1]:getRawMetadata('path')
+		return LrPathUtils.parent(firstPath)
+	end
+	return props.outputFolder
+end
+
 --------------------------------------------------------------------------------
 -- Preferences (remembered between sessions)
 
 local REMEMBERED = {
 	'resolution', 'orientation', 'fit', 'fps', 'customFps', 'codec', 'qualityPreset',
-	'deflicker', 'deflickerSize', 'previewRes', 'outputFolder',
+	'deflicker', 'deflickerSize', 'previewRes', 'outputFolder', 'saveInSourceFolder',
 }
 
 local function loadPrefs(props)
@@ -110,7 +122,8 @@ end
 
 local function runGeneration(props, photos, aspects)
 	local targetW, targetH = targetDims(props)
-	local outputPath = LrPathUtils.child(props.outputFolder, sanitizeFileName(props.fileName))
+	local outputFolder = resolveOutputFolder(props, photos)
+	local outputPath = LrPathUtils.child(outputFolder, sanitizeFileName(props.fileName))
 
 	if LrFileUtils.exists(outputPath) then
 		local answer = LrDialogs.confirm(
@@ -171,7 +184,8 @@ local function runGeneration(props, photos, aspects)
 	local encodeScope = LrProgressScope {
 		title = LOC("$$$/Timelapse/Progress/Encode=Timelapse: encoding ^1 frames with ffmpeg...", result.count),
 	}
-	local ok, status, tail = FFmpegRunner.run({
+	encodeScope:setCancelable(true)
+	local outcome, _, tail = FFmpegRunner.run({
 		ffmpegPath = props.ffmpegPath,
 		inputPattern = result.pattern,
 		fps = effectiveFps(props),
@@ -195,12 +209,16 @@ local function runGeneration(props, photos, aspects)
 	})
 	encodeScope:done()
 
-	if not ok then
+	if outcome == 'canceled' then
+		LrFileUtils.delete(sessionDir)
+		return
+	end
+	if outcome ~= 'ok' then
 		-- Keep the session folder so the ffmpeg log can be inspected.
 		LrDialogs.message(
 			LOC "$$$/Timelapse/Error/EncodeFailed=ffmpeg could not encode the video",
-			LOC("$$$/Timelapse/Error/EncodeFailedDetail=Exit status: ^1^nLog: ^2^n^n^3",
-				tostring(status), LrPathUtils.child(sessionDir, 'ffmpeg.log'), tail or ''),
+			LOC("$$$/Timelapse/Error/EncodeFailedDetail=Log: ^1^n^n^2",
+				LrPathUtils.child(sessionDir, 'ffmpeg.log'), tail or ''),
 			'critical')
 		return
 	end
@@ -252,25 +270,20 @@ function TimelapseDialog.show(context, args)
 	props.maxBitrate = 0
 	props.previewRes = 480
 	props.outputFolder = defaultOutputFolder()
+	props.saveInSourceFolder = false
 	loadPrefs(props)
 	props.fileName = 'timelapse_' .. os.date('%Y%m%d_%H%M%S')
 	props.previewRunning = false
 
-	-- ffmpeg detection. The path itself is now configured in Lightroom's
-	-- Plug-in Manager (see PluginInfoProvider.lua); this dialog only shows
-	-- a read-only status.
-	local ffmpegPath, ffmpegVersion, ffmpegSufficient = FFmpegLocator.locate()
+	-- ffmpeg detection. Path, version and the minimum-version warning are
+	-- only ever shown in Lightroom's Plug-in Manager (see
+	-- PluginInfoProvider.lua); this dialog just needs to know whether
+	-- generation can proceed, surfaced only as a validation message.
+	local ffmpegPath = FFmpegLocator.locate()
 	props.ffmpegPath = ffmpegPath
-	props.ffmpegVersionInsufficient = (ffmpegPath ~= nil and not ffmpegSufficient)
-	if ffmpegPath then
-		props.ffmpegStatus = LOC("$$$/Timelapse/FFmpeg/Found=ffmpeg ^1 — ^2", ffmpegVersion, ffmpegPath)
-		props.ffmpegWarningText = LOC(
-			"$$$/Timelapse/FFmpeg/TooOld=ffmpeg ^1 detected — version ^2 or newer is recommended; some features (e.g. deflicker) may not work.",
-			ffmpegVersion, FFmpegCommand.MIN_FFMPEG_VERSION)
-	else
-		props.ffmpegStatus = LOC "$$$/Timelapse/FFmpeg/Missing=ffmpeg not found. Configure it in Lightroom's Plug-in Manager (File > Plug-in Manager > Timelapse Creator)."
-		props.ffmpegWarningText = ''
-	end
+	props.ffmpegStatus = ffmpegPath
+		and LOC "$$$/Timelapse/FFmpeg/ConfiguredElsewhere=ffmpeg is configured."
+		or LOC "$$$/Timelapse/FFmpeg/Missing=ffmpeg not found. Configure it in Lightroom's Plug-in Manager (File > Plug-in Manager > Timelapse Creator)."
 
 	-- Advanced fields follow the quality preset until edited by hand.
 	local autoKeyint = {}
@@ -316,6 +329,13 @@ function TimelapseDialog.show(context, args)
 	props:addObserver('qualityPreset', applyQualityPreset)
 	props:addObserver('codec', applyQualityPreset)
 
+	local function updateOutputFolderDisplay()
+		props.outputFolderDisplay = resolveOutputFolder(props, photos)
+	end
+	updateOutputFolderDisplay()
+	props:addObserver('saveInSourceFolder', updateOutputFolderDisplay)
+	props:addObserver('outputFolder', updateOutputFolderDisplay)
+
 	local hdrText
 	if args.hdrInfo.allHdr then
 		hdrText = LOC("$$$/Timelapse/Hdr/All=All ^1 photos are HDR. HDR output is not available yet: run the diagnostics to probe your Lightroom version.", args.hdrInfo.total)
@@ -323,6 +343,85 @@ function TimelapseDialog.show(context, args)
 		hdrText = LOC("$$$/Timelapse/Hdr/Some=HDR photos: ^1 of ^2 (HDR output requires all photos to be HDR).",
 			args.hdrInfo.hdrCount, args.hdrInfo.total)
 	end
+
+	-- Static frame-scrubber preview: instant, no ffmpeg involved (unlike the
+	-- "Build preview" MP4 below). Shows the photo's own library thumbnail
+	-- (develop settings and any per-photo crop applied), not the target
+	-- video's crop/fit — the two can differ.
+	--
+	-- addObserver callbacks run in a restricted Lightroom context where
+	-- yielding is not allowed — confirmed by a real "Yielding is not
+	-- allowed within a C or metamethod call (...for condition
+	-- previewFrameIndex)" plugin error, the same class of bug as the
+	-- pcall/yield issues fixed earlier, but here even starting a task from
+	-- inside the observer was enough to trigger it. The observer below only
+	-- records the request (plain variables, no yielding calls); a single
+	-- long-lived watcher task started once here does the actual async work.
+	local FRAME_PREVIEW_W, FRAME_PREVIEW_H = 320, 240
+	local FRAME_PREVIEW_DEBOUNCE = 0.15
+	props.previewFrameIndex = 1
+	props.previewFrameImagePath = nil
+	props.previewFrameLabel = ''
+
+	local lastFramePreviewPath
+	local requestedFrameIndex = 1
+	local requestedFrameToken = 1
+	local handledFrameToken = 0
+	local frameWatcherRunning = true
+
+	props:addObserver('previewFrameIndex', function()
+		requestedFrameIndex = math.floor(props.previewFrameIndex)
+		requestedFrameToken = requestedFrameToken + 1
+	end)
+
+	LrTasks.startAsyncTask(function()
+		while frameWatcherRunning do
+			if requestedFrameToken == handledFrameToken then
+				LrTasks.sleep(0.05)
+			else
+				local myToken = requestedFrameToken
+				local index = requestedFrameIndex
+				LrTasks.sleep(FRAME_PREVIEW_DEBOUNCE)
+				if frameWatcherRunning and requestedFrameToken == myToken then
+					handledFrameToken = myToken
+					local photo = photos[index]
+					props.previewFrameLabel = LOC("$$$/Timelapse/UI/FramePreviewLabel=Photo ^1 of ^2 — ^3",
+						index, #photos, LrPathUtils.leafName(photo:getRawMetadata('path')))
+
+					local jpegData, finished
+					photo:requestJpegThumbnail(FRAME_PREVIEW_W, FRAME_PREVIEW_H, function(data, _)
+						jpegData = data
+						finished = true
+					end)
+					local waited = 0
+					while not finished and waited < 15 do
+						LrTasks.sleep(0.05)
+						waited = waited + 0.05
+					end
+
+					if frameWatcherRunning and requestedFrameToken == myToken
+						and type(jpegData) == 'string' and #jpegData > 0 then
+						local path = LrPathUtils.child(tempRoot(),
+							string.format('frame_preview_%d_%d.jpg', index, myToken))
+						local file = io.open(path, 'wb')
+						if file then
+							file:write(jpegData)
+							file:close()
+							props.previewFrameImagePath = path
+							local previous = lastFramePreviewPath
+							lastFramePreviewPath = path
+							if previous then LrFileUtils.delete(previous) end
+						end
+					end
+				end
+			end
+		end
+	end, 'TimelapseCreator frame preview watcher')
+
+	context:addCleanupHandler(function()
+		frameWatcherRunning = false
+		if lastFramePreviewPath then LrFileUtils.delete(lastFramePreviewPath) end
+	end)
 
 	local fpsItems, resItems = {}, {}
 	for _, v in ipairs(FPS_VALUES) do
@@ -343,211 +442,274 @@ function TimelapseDialog.show(context, args)
 
 		f:static_text { title = bind 'summaryText', font = '<system/bold>', fill_horizontal = 1 },
 		f:static_text { title = hdrText, fill_horizontal = 1 },
-		f:separator { fill_horizontal = 1 },
 
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Resolution=Format:", width = LrView.share 'label' },
-			f:popup_menu { value = bind 'resolution', items = resItems },
-			f:popup_menu {
-				value = bind 'orientation',
-				items = {
-					{ title = LOC "$$$/Timelapse/UI/Landscape=Landscape", value = 'landscape' },
-					{ title = LOC "$$$/Timelapse/UI/Portrait=Portrait",  value = 'portrait' },
-				},
-			},
-			f:popup_menu {
-				value = bind 'fit',
-				items = {
-					{ title = LOC "$$$/Timelapse/UI/Crop=Fill (center crop)",     value = 'crop' },
-					{ title = LOC "$$$/Timelapse/UI/Pad=Fit (black bars)", value = 'pad' },
-				},
-			},
-		},
-
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Speed=Frame rate:", width = LrView.share 'label' },
-			f:popup_menu { value = bind 'fps', items = fpsItems },
-			f:edit_field {
-				value = bind 'customFps',
-				min = 1, max = 240, precision = 3, width_in_digits = 7,
-				visible = LrView.bind {
-					keys = { 'fps' },
-					operation = function(_, values, fromTable)
-						if fromTable then return values.fps == 'custom' end
-						return LrBinding.kUnsupportedDirection
-					end,
-				},
-			},
-			f:static_text { title = LOC "$$$/Timelapse/UI/SpeedNote=1 photo = 1 frame" },
-		},
-
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Codec=Codec:", width = LrView.share 'label' },
-			f:popup_menu {
-				value = bind 'codec',
-				items = {
-					{ title = 'H.264 (AVC)',  value = 'h264' },
-					{ title = 'H.265 (HEVC)', value = 'h265' },
-				},
-			},
-			f:static_text { title = LOC "$$$/Timelapse/UI/Quality=Quality:" },
-			f:popup_menu {
-				value = bind 'qualityPreset',
-				items = {
-					{ title = LOC "$$$/Timelapse/UI/QualityHigh=High",     value = 'high' },
-					{ title = LOC "$$$/Timelapse/UI/QualityMedium=Medium", value = 'medium' },
-					{ title = LOC "$$$/Timelapse/UI/QualityLow=Low",       value = 'low' },
-				},
-			},
-		},
-
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Options=Options:", width = LrView.share 'label' },
-			f:checkbox { title = LOC "$$$/Timelapse/UI/Deflicker=Deflicker", value = bind 'deflicker' },
-			f:static_text { title = LOC "$$$/Timelapse/UI/DeflickerSize=window:", enabled = bind 'deflicker' },
-			f:edit_field {
-				value = bind 'deflickerSize', enabled = bind 'deflicker',
-				min = 2, max = 129, precision = 0, width_in_digits = 4,
-			},
-			f:checkbox { title = LOC "$$$/Timelapse/UI/Advanced=Advanced settings", value = bind 'showAdvanced' },
-		},
-
-		f:column {
-			visible = bind 'showAdvanced',
-			spacing = f:control_spacing(),
+		f:group_box {
+			title = LOC "$$$/Timelapse/UI/GroupPreview=Preview",
 			fill_horizontal = 1,
+			spacing = f:control_spacing(),
+
+			f:column {
+				spacing = f:control_spacing(),
+				fill_horizontal = 1,
+				place_horizontal = 0.5,
+				f:picture {
+					value = bind 'previewFrameImagePath',
+					width = 320,
+					height = 240,
+				},
+				f:row {
+					spacing = f:label_spacing(),
+					f:push_button {
+						title = '◀',
+						width = 30,
+						action = function()
+							props.previewFrameIndex = math.max(1, props.previewFrameIndex - 1)
+						end,
+					},
+					f:slider {
+						value = bind 'previewFrameIndex',
+						min = 1, max = #photos, integral = true,
+						width = 300,
+					},
+					f:push_button {
+						title = '▶',
+						width = 30,
+						action = function()
+							props.previewFrameIndex = math.min(#photos, props.previewFrameIndex + 1)
+						end,
+					},
+				},
+				f:static_text { title = bind 'previewFrameLabel' },
+				f:static_text {
+					title = LOC "$$$/Timelapse/UI/FramePreviewNote=Shows the photo as developed, not the video's crop/fit",
+				},
+			},
+
+			f:separator { fill_horizontal = 1 },
+
 			f:row {
 				spacing = f:label_spacing(),
-				f:static_text { title = LOC "$$$/Timelapse/UI/Crf=CRF:", width = LrView.share 'label' },
-				f:edit_field { value = bind 'crf', min = 0, max = 51, precision = 0, width_in_digits = 4 },
-				f:static_text { title = LOC "$$$/Timelapse/UI/EncoderPreset=Encoder preset:" },
+				f:static_text { title = LOC "$$$/Timelapse/UI/Preview=Video preview:", width = LrView.share 'label' },
 				f:popup_menu {
-					value = bind 'encoderPreset',
+					value = bind 'previewRes',
 					items = {
-						{ title = 'ultrafast', value = 'ultrafast' },
-						{ title = 'fast',      value = 'fast' },
-						{ title = 'medium',    value = 'medium' },
-						{ title = 'slow',      value = 'slow' },
-						{ title = 'veryslow',  value = 'veryslow' },
+						{ title = '480p', value = 480 },
+						{ title = '240p', value = 240 },
+					},
+				},
+				f:push_button {
+					title = LOC "$$$/Timelapse/UI/BuildPreview=Build preview",
+					enabled = LrBinding.negativeOfKey('previewRunning'),
+					action = function()
+						if props.previewRunning or not props.ffmpegPath then
+							if not props.ffmpegPath then
+								LrDialogs.message(props.ffmpegStatus, nil, 'warning')
+							end
+							return
+						end
+						props.previewRunning = true
+						LrTasks.startAsyncTask(function()
+							local scope = LrProgressScope {
+								title = LOC "$$$/Timelapse/Progress/Preview=Timelapse: building preview...",
+							}
+							scope:setCancelable(true)
+							local targetW, targetH = targetDims(props)
+							local ok, pathOrMessage
+							local pcallOk, pcallErr = LrTasks.pcall(function()
+								ok, pathOrMessage = PreviewBuilder.build {
+									photos = photos,
+									targetW = targetW,
+									targetH = targetH,
+									shortSide = tonumber(props.previewRes) or 480,
+									fps = effectiveFps(props),
+									fit = props.fit,
+									deflicker = props.deflicker,
+									deflickerSize = tonumber(props.deflickerSize),
+									ffmpegPath = props.ffmpegPath,
+									tempRoot = tempRoot(),
+									progressScope = scope,
+								}
+							end)
+							scope:done()
+							props.previewRunning = false
+							if not pcallOk then
+								Log:error('Preview failed: ' .. tostring(pcallErr))
+								LrDialogs.message(LOC "$$$/Timelapse/Preview/Failed=Preview failed",
+									tostring(pcallErr), 'warning')
+							elseif ok then
+								Platform.openFile(pathOrMessage)
+							elseif pathOrMessage ~= 'canceled' then
+								LrDialogs.message(LOC "$$$/Timelapse/Preview/Failed=Preview failed",
+									tostring(pathOrMessage), 'warning')
+							end
+						end, 'TimelapseCreator preview')
+					end,
+				},
+				f:static_text {
+					title = LOC "$$$/Timelapse/UI/PreviewNote=Opens in the system video player",
+				},
+			},
+		},
+
+		f:group_box {
+			title = LOC "$$$/Timelapse/UI/GroupFormat=Format & Speed",
+			fill_horizontal = 1,
+			spacing = f:control_spacing(),
+
+			f:row {
+				spacing = f:label_spacing(),
+				f:static_text { title = LOC "$$$/Timelapse/UI/Resolution=Format:", width = LrView.share 'label' },
+				f:popup_menu { value = bind 'resolution', items = resItems },
+				f:popup_menu {
+					value = bind 'orientation',
+					items = {
+						{ title = LOC "$$$/Timelapse/UI/Landscape=Landscape", value = 'landscape' },
+						{ title = LOC "$$$/Timelapse/UI/Portrait=Portrait",  value = 'portrait' },
+					},
+				},
+				f:popup_menu {
+					value = bind 'fit',
+					items = {
+						{ title = LOC "$$$/Timelapse/UI/Crop=Fill (center crop)",     value = 'crop' },
+						{ title = LOC "$$$/Timelapse/UI/Pad=Fit (black bars)", value = 'pad' },
 					},
 				},
 			},
+
 			f:row {
 				spacing = f:label_spacing(),
-				f:static_text { title = LOC "$$$/Timelapse/UI/Keyframes=Keyframes:", width = LrView.share 'label' },
-				f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMin=min interval:" },
-				f:edit_field { value = bind 'keyintMin', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
-				f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMax=max interval:" },
-				f:edit_field { value = bind 'keyintMax', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
-				f:static_text { title = LOC "$$$/Timelapse/UI/KeyintUnit=frames" },
-			},
-			f:row {
-				spacing = f:label_spacing(),
-				f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrate=Max bitrate:", width = LrView.share 'label' },
-				f:edit_field { value = bind 'maxBitrate', min = 0, max = 200000, precision = 0, width_in_digits = 7 },
-				f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrateUnit=kbit/s (0 = unlimited)" },
+				f:static_text { title = LOC "$$$/Timelapse/UI/Speed=Frame rate:", width = LrView.share 'label' },
+				f:popup_menu { value = bind 'fps', items = fpsItems },
+				f:edit_field {
+					value = bind 'customFps',
+					min = 1, max = 240, precision = 3, width_in_digits = 7,
+					visible = LrView.bind {
+						keys = { 'fps' },
+						operation = function(_, values, fromTable)
+							if fromTable then return values.fps == 'custom' end
+							return LrBinding.kUnsupportedDirection
+						end,
+					},
+				},
+				f:static_text { title = LOC "$$$/Timelapse/UI/SpeedNote=1 photo = 1 frame" },
 			},
 		},
 
-		f:separator { fill_horizontal = 1 },
+		f:group_box {
+			title = LOC "$$$/Timelapse/UI/GroupEncoding=Encoding",
+			fill_horizontal = 1,
+			spacing = f:control_spacing(),
 
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Output=Save to:", width = LrView.share 'label' },
-			f:static_text { title = bind 'outputFolder', truncation = 'middle', width_in_chars = 30 },
-			f:push_button {
-				title = LOC "$$$/Timelapse/UI/Choose=Choose...",
-				action = function()
-					local folders = LrDialogs.runOpenPanel {
-						title = LOC "$$$/Timelapse/UI/ChooseFolder=Choose the output folder",
-						canChooseFiles = false,
-						canChooseDirectories = true,
-						canCreateDirectories = true,
-						allowsMultipleSelection = false,
-					}
-					if folders and folders[1] then
-						props.outputFolder = folders[1]
-					end
-				end,
-			},
-			f:edit_field { value = bind 'fileName', width_in_chars = 20 },
-		},
-
-		f:row {
-			spacing = f:label_spacing(),
-			f:static_text { title = LOC "$$$/Timelapse/UI/Preview=Preview:", width = LrView.share 'label' },
-			f:popup_menu {
-				value = bind 'previewRes',
-				items = {
-					{ title = '480p', value = 480 },
-					{ title = '240p', value = 240 },
+			f:row {
+				spacing = f:label_spacing(),
+				f:static_text { title = LOC "$$$/Timelapse/UI/Codec=Codec:", width = LrView.share 'label' },
+				f:popup_menu {
+					value = bind 'codec',
+					items = {
+						{ title = 'H.264 (AVC)',  value = 'h264' },
+						{ title = 'H.265 (HEVC)', value = 'h265' },
+					},
+				},
+				f:static_text { title = LOC "$$$/Timelapse/UI/Quality=Quality:" },
+				f:popup_menu {
+					value = bind 'qualityPreset',
+					items = {
+						{ title = LOC "$$$/Timelapse/UI/QualityHigh=High",     value = 'high' },
+						{ title = LOC "$$$/Timelapse/UI/QualityMedium=Medium", value = 'medium' },
+						{ title = LOC "$$$/Timelapse/UI/QualityLow=Low",       value = 'low' },
+					},
 				},
 			},
-			f:push_button {
-				title = LOC "$$$/Timelapse/UI/BuildPreview=Build preview",
-				enabled = LrBinding.negativeOfKey('previewRunning'),
-				action = function()
-					if props.previewRunning or not props.ffmpegPath then
-						if not props.ffmpegPath then
-							LrDialogs.message(props.ffmpegStatus, nil, 'warning')
-						end
-						return
-					end
-					props.previewRunning = true
-					LrTasks.startAsyncTask(function()
-						local scope = LrProgressScope {
-							title = LOC "$$$/Timelapse/Progress/Preview=Timelapse: building preview...",
-						}
-						scope:setCancelable(true)
-						local targetW, targetH = targetDims(props)
-						local ok, pathOrMessage
-						local pcallOk, pcallErr = LrTasks.pcall(function()
-							ok, pathOrMessage = PreviewBuilder.build {
-								photos = photos,
-								targetW = targetW,
-								targetH = targetH,
-								shortSide = tonumber(props.previewRes) or 480,
-								fps = effectiveFps(props),
-								fit = props.fit,
-								deflicker = props.deflicker,
-								deflickerSize = tonumber(props.deflickerSize),
-								ffmpegPath = props.ffmpegPath,
-								tempRoot = tempRoot(),
-								progressScope = scope,
-							}
-						end)
-						scope:done()
-						props.previewRunning = false
-						if not pcallOk then
-							Log:error('Preview failed: ' .. tostring(pcallErr))
-							LrDialogs.message(LOC "$$$/Timelapse/Preview/Failed=Preview failed",
-								tostring(pcallErr), 'warning')
-						elseif ok then
-							Platform.openFile(pathOrMessage)
-						elseif pathOrMessage ~= 'canceled' then
-							LrDialogs.message(LOC "$$$/Timelapse/Preview/Failed=Preview failed",
-								tostring(pathOrMessage), 'warning')
-						end
-					end, 'TimelapseCreator preview')
-				end,
+
+			f:row {
+				spacing = f:label_spacing(),
+				f:static_text { title = LOC "$$$/Timelapse/UI/Options=Options:", width = LrView.share 'label' },
+				f:checkbox { title = LOC "$$$/Timelapse/UI/Deflicker=Deflicker", value = bind 'deflicker' },
+				f:static_text { title = LOC "$$$/Timelapse/UI/DeflickerSize=window:", enabled = bind 'deflicker' },
+				f:edit_field {
+					value = bind 'deflickerSize', enabled = bind 'deflicker',
+					min = 2, max = 129, precision = 0, width_in_digits = 4,
+				},
+				f:checkbox { title = LOC "$$$/Timelapse/UI/Advanced=Advanced settings", value = bind 'showAdvanced' },
 			},
-			f:static_text {
-				title = LOC "$$$/Timelapse/UI/PreviewNote=Opens in the system video player",
+
+			f:column {
+				visible = bind 'showAdvanced',
+				spacing = f:control_spacing(),
+				fill_horizontal = 1,
+				f:row {
+					spacing = f:label_spacing(),
+					f:static_text { title = LOC "$$$/Timelapse/UI/Crf=CRF:", width = LrView.share 'label' },
+					f:edit_field { value = bind 'crf', min = 0, max = 51, precision = 0, width_in_digits = 4 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/EncoderPreset=Encoder preset:" },
+					f:popup_menu {
+						value = bind 'encoderPreset',
+						items = {
+							{ title = 'ultrafast', value = 'ultrafast' },
+							{ title = 'fast',      value = 'fast' },
+							{ title = 'medium',    value = 'medium' },
+							{ title = 'slow',      value = 'slow' },
+							{ title = 'veryslow',  value = 'veryslow' },
+						},
+					},
+				},
+				f:row {
+					spacing = f:label_spacing(),
+					f:static_text { title = LOC "$$$/Timelapse/UI/Keyframes=Keyframes:", width = LrView.share 'label' },
+					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMin=min interval:" },
+					f:edit_field { value = bind 'keyintMin', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMax=max interval:" },
+					f:edit_field { value = bind 'keyintMax', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintUnit=frames" },
+				},
+				f:row {
+					spacing = f:label_spacing(),
+					f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrate=Max bitrate:", width = LrView.share 'label' },
+					f:edit_field { value = bind 'maxBitrate', min = 0, max = 200000, precision = 0, width_in_digits = 7 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrateUnit=kbit/s (0 = unlimited)" },
+				},
 			},
 		},
 
-		f:separator { fill_horizontal = 1 },
-		f:static_text { title = bind 'ffmpegStatus', truncation = 'middle', fill_horizontal = 1, width_in_chars = 55 },
-		f:static_text {
-			title = bind 'ffmpegWarningText',
-			visible = bind 'ffmpegVersionInsufficient',
+		f:group_box {
+			title = LOC "$$$/Timelapse/UI/GroupOutput=Output",
 			fill_horizontal = 1,
-			width_in_chars = 55,
-			height_in_lines = 2,
+			spacing = f:control_spacing(),
+
+			f:row {
+				spacing = f:label_spacing(),
+				f:static_text { title = LOC "$$$/Timelapse/UI/Output=Save to:", width = LrView.share 'label' },
+				f:static_text { title = bind 'outputFolderDisplay', truncation = 'middle', width_in_chars = 30 },
+				f:push_button {
+					title = LOC "$$$/Timelapse/UI/Choose=Choose...",
+					enabled = LrBinding.negativeOfKey('saveInSourceFolder'),
+					action = function()
+						local folders = LrDialogs.runOpenPanel {
+							title = LOC "$$$/Timelapse/UI/ChooseFolder=Choose the output folder",
+							canChooseFiles = false,
+							canChooseDirectories = true,
+							canCreateDirectories = true,
+							allowsMultipleSelection = false,
+						}
+						if folders and folders[1] then
+							props.outputFolder = folders[1]
+						end
+					end,
+				},
+				f:edit_field { value = bind 'fileName', width_in_chars = 20 },
+			},
+
+			f:row {
+				spacing = f:label_spacing(),
+				f:spacer { width = LrView.share 'label' },
+				f:checkbox {
+					title = LOC "$$$/Timelapse/UI/SaveInSourceFolder=Save in the photos' original folder",
+					value = bind 'saveInSourceFolder',
+				},
+				f:static_text {
+					title = LOC "$$$/Timelapse/UI/SaveInSourceFolderNote=Uses the folder of the first photo in the sequence",
+				},
+			},
 		},
 	}
 	end
@@ -568,7 +730,8 @@ function TimelapseDialog.show(context, args)
 		elseif props.fps == 'custom' and not (tonumber(props.customFps) and tonumber(props.customFps) > 0
 			and tonumber(props.customFps) <= 240) then
 			LrDialogs.message(LOC "$$$/Timelapse/Error/BadFps=Please enter a valid custom frame rate (0-240 fps).", nil, 'warning')
-		elseif not props.outputFolder or LrFileUtils.exists(props.outputFolder) ~= 'directory' then
+		elseif not props.saveInSourceFolder
+			and (not props.outputFolder or LrFileUtils.exists(props.outputFolder) ~= 'directory') then
 			LrDialogs.message(LOC "$$$/Timelapse/Error/BadFolder=Please choose a valid output folder.", nil, 'warning')
 		elseif tonumber(props.keyintMin) and tonumber(props.keyintMax)
 			and tonumber(props.keyintMin) > tonumber(props.keyintMax) then

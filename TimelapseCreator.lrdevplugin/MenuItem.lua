@@ -16,10 +16,22 @@ local Log = require 'Log'
 
 LrTasks.startAsyncTask(function()
 	LrFunctionContext.callWithContext('TimelapseCreatorMenu', function(context)
+		-- One continuous progress scope for the whole pre-dialog phase, so
+		-- there is visible feedback from the moment the menu item is
+		-- clicked (metadata reads and HDR checks can take a few seconds on
+		-- large selections, with nothing else shown otherwise).
+		local scope = LrProgressScope {
+			title = LOC "$$$/Timelapse/Progress/Loading=Timelapse Creator: loading...",
+			functionContext = context,
+		}
+		scope:setCancelable(true)
+		scope:setIndeterminate()
+
 		local catalog = LrApplication.activeCatalog()
 		local photos = catalog:getTargetPhotos()
 
 		if not photos or #photos == 0 then
+			scope:done()
 			LrDialogs.message(
 				LOC "$$$/Timelapse/NoSelection/Title=No photos selected",
 				LOC "$$$/Timelapse/NoSelection/Detail=Select the photos for the timelapse, then run the command again.",
@@ -27,6 +39,7 @@ LrTasks.startAsyncTask(function()
 			return
 		end
 
+		scope:setCaption(LOC "$$$/Timelapse/Progress/ReadingMetadata=Reading photo metadata...")
 		local meta = catalog:batchGetRawMetadata(photos,
 			{ 'dateTimeOriginal', 'croppedDimensions', 'fileFormat', 'path' })
 
@@ -39,6 +52,7 @@ LrTasks.startAsyncTask(function()
 		end
 
 		if #stills < 2 then
+			scope:done()
 			LrDialogs.message(
 				LOC "$$$/Timelapse/TooFew/Title=Not enough photos",
 				LOC "$$$/Timelapse/TooFew/Detail=A timelapse needs at least 2 still photos (a few hundred is typical).",
@@ -64,13 +78,11 @@ LrTasks.startAsyncTask(function()
 			end
 		end
 
-		local scope = LrProgressScope {
-			title = LOC "$$$/Timelapse/Progress/Analyze=Timelapse: analyzing photos...",
-			functionContext = context,
-		}
-		scope:setCancelable(true)
+		scope:setCaption(LOC "$$$/Timelapse/Progress/Analyze=Checking for HDR...")
 		local hdrInfo = HdrDetector.analyze(stills, scope)
 		scope:done()
+
+		if scope:isCanceled() then return end
 
 		Log:info(string.format('Opening dialog: %d photos, %d HDR', #stills, hdrInfo.hdrCount))
 		TimelapseDialog.show(context, {
