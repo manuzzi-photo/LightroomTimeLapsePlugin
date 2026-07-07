@@ -44,6 +44,9 @@ end
 --   fit           ('crop'|'pad')
 --   deflicker     (boolean), deflickerSize (number|nil)
 --   ffmpegPath    (string)
+--   hardware      (boolean|nil)  use VideoToolbox if available — the preview
+--                 is already optimized for speed over quality, so hardware
+--                 acceleration is a natural fit whenever it's on offer
 --   tempRoot      (string)  existing directory for preview session folders
 --   progressScope (LrProgressScope|nil)
 --
@@ -103,7 +106,7 @@ function PreviewBuilder.build(opts)
 
 	local outputPath = LrPathUtils.child(dir, 'preview.mp4')
 	local logFile = LrPathUtils.child(dir, 'ffmpeg.log')
-	local outcome, _, tail = FFmpegRunner.run({
+	local ffmpegOpts = {
 		ffmpegPath = opts.ffmpegPath,
 		inputPattern = LrPathUtils.child(dir, 'frame_%06d.jpg'),
 		fps = opts.fps,
@@ -111,12 +114,19 @@ function PreviewBuilder.build(opts)
 		height = ph,
 		fit = opts.fit,
 		codec = 'h264',
-		crf = 28,
-		encoderPreset = 'ultrafast',
 		deflicker = opts.deflicker,
 		deflickerSize = opts.deflickerSize,
 		outputPath = outputPath,
-	}, { logFile = logFile, progressScope = opts.progressScope })
+	}
+	if opts.hardware then
+		ffmpegOpts.hardware = true
+		ffmpegOpts.bitrate = FFmpegCommand.resolveHardwareBitrate('medium', 'h264', pw, ph)
+	else
+		ffmpegOpts.crf = 28
+		ffmpegOpts.encoderPreset = 'ultrafast'
+	end
+	local outcome, _, tail = FFmpegRunner.run(ffmpegOpts,
+		{ logFile = logFile, progressScope = opts.progressScope })
 
 	if outcome == 'canceled' then
 		return false, 'canceled'

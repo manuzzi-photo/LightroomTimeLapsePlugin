@@ -56,4 +56,41 @@ echo "--- keyframe intervals (h264_crop)"
 ffprobe -v error -select_streams v:0 -show_entries frame=pict_type -of csv=p=0 \
   "$WORK/h264_crop.mp4" | awk -F, '{ if ($1=="I") print NR-1 }' | head -5
 
+# Hardware (VideoToolbox) and ProRes: only run if this machine actually
+# has them (VideoToolbox is macOS-only; ProRes needs no extra check since
+# prores_ks is a normal software encoder, always present).
+build_cmd_extra() {
+  lua -e "
+    package.path = 'TimelapseCreator.lrdevplugin/?.lua;' .. package.path
+    local C = require 'FFmpegCommand'
+    local opts = {
+      ffmpegPath = '$(command -v ffmpeg)',
+      inputPattern = '$WORK/frame_%06d.jpg',
+      fps = 30, width = 1920, height = 1080, fit = 'crop',
+      outputPath = '$WORK/$1.$2',
+      $3
+    }
+    print(C.buildCommand(opts, false))
+  "
+}
+run_case_extra() {
+  NAME=$1; EXT=$2
+  CMD=$(build_cmd_extra "$1" "$2" "$3")
+  echo "--- $NAME"
+  eval "$CMD" >"$WORK/$NAME.log" 2>&1 || { echo "ENCODE FAILED"; cat "$WORK/$NAME.log"; exit 1; }
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name,width,height,pix_fmt,profile \
+    -of csv=p=0 "$WORK/$NAME.$EXT"
+}
+
+run_case_extra prores_sw mov "codec='prores', proresProfile=3"
+
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_videotoolbox; then
+  run_case_extra hw_h264 mp4 "codec='h264', hardware=true"
+  run_case_extra hw_h265 mp4 "codec='h265', hardware=true, bitrate=6000"
+  run_case_extra hw_prores mov "codec='prores', hardware=true"
+else
+  echo "--- VideoToolbox not available on this machine, skipping hardware cases"
+fi
+
 echo "All integration cases passed"

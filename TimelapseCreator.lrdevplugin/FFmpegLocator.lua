@@ -36,6 +36,21 @@ function FFmpegLocator.validate(path)
 	return content:match('ffmpeg version%s+(%S+)')
 end
 
+-- True when the given ffmpeg binary was built with VideoToolbox support.
+-- macOS only: VideoToolbox is part of the OS, but a minimal/custom ffmpeg
+-- build could still have been compiled without it, so this probes the
+-- actual binary rather than assuming availability from the platform alone.
+function FFmpegLocator.hasHardwareAcceleration(path)
+	if Platform.isWindows or type(path) ~= 'string' or path == '' then
+		return false
+	end
+	local out = tempChild('TimelapseCreator_ffmpeg_encoders.txt')
+	Platform.execute(Platform.quote(path) .. ' -hide_banner -encoders > ' .. Platform.quote(out) .. ' 2>&1')
+	local content = Platform.readFile(out) or ''
+	LrFileUtils.delete(out)
+	return content:find('h264_videotoolbox', 1, true) ~= nil
+end
+
 -- Returns path, version, sufficient — or nil, nil, false when ffmpeg cannot
 -- be found. `sufficient` is false when the detected version is older than
 -- FFmpegCommand.MIN_FFMPEG_VERSION (informational only, not a hard block).

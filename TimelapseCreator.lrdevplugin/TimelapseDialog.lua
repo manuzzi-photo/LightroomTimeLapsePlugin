@@ -58,15 +58,16 @@ local function effectiveFps(props)
 	return tonumber(props.fps) or 30
 end
 
-local function sanitizeFileName(name)
+-- Strips any existing .mp4/.mov extension and appends the one matching
+-- `codec` (ProRes conventionally ships in .mov, H.264/H.265 in .mp4), so
+-- switching codec never silently keeps a mismatched extension.
+local function sanitizeFileName(name, codec)
 	name = tostring(name or ''):gsub('[/\\:%*%?"<>|]', '-'):gsub('^%s+', ''):gsub('%s+$', '')
 	if name == '' then
 		name = 'timelapse_' .. os.date('%Y%m%d_%H%M%S')
 	end
-	if not name:lower():match('%.mp4$') then
-		name = name .. '.mp4'
-	end
-	return name
+	name = name:gsub('%.[mM][oO][vV]$', ''):gsub('%.[mM][pP]4$', '')
+	return name .. '.' .. FFmpegCommand.fileExtensionForCodec(codec)
 end
 
 local function tempRoot()
@@ -79,6 +80,40 @@ local function defaultOutputFolder()
 	local ok, path = pcall(LrPathUtils.getStandardFilePath, 'pictures')
 	if ok and path then return path end
 	return LrPathUtils.getStandardFilePath('home')
+end
+
+-- Resolves the codec/quality-preset combination into the FFmpegCommand
+-- options that actually control encoded quality (crf+preset, hardware
+-- bitrate, or a ProRes profile — mutually exclusive, see FFmpegCommand.lua).
+local function resolveEncodeOpts(props, targetW, targetH)
+	if props.codec == 'prores' then
+		return {
+			codec = 'prores',
+			hardware = props.hardware,
+			proresProfile = FFmpegCommand.resolveProresProfile(props.qualityPreset),
+			keyintMax = nil, keyintMin = nil, -- all-intra, no GOP
+		}
+	end
+	if props.hardware then
+		return {
+			codec = props.codec,
+			hardware = true,
+			bitrate = tonumber(props.maxBitrate) or
+				FFmpegCommand.resolveHardwareBitrate(props.qualityPreset, props.codec, targetW, targetH),
+			keyintMax = tonumber(props.keyintMax),
+			keyintMin = nil, -- no VideoToolbox equivalent
+		}
+	end
+	local quality = FFmpegCommand.resolveQualityPreset(props.qualityPreset, props.codec)
+	return {
+		codec = props.codec,
+		hardware = false,
+		crf = tonumber(props.crf) or quality.crf,
+		encoderPreset = props.encoderPreset or quality.preset,
+		keyintMin = tonumber(props.keyintMin),
+		keyintMax = tonumber(props.keyintMax),
+		maxBitrate = tonumber(props.maxBitrate),
+	}
 end
 
 -- When saveInSourceFolder is on, the video is saved next to the first photo
@@ -98,7 +133,7 @@ end
 
 local REMEMBERED = {
 	'resolution', 'orientation', 'fit', 'fps', 'customFps', 'codec', 'qualityPreset',
-	'deflicker', 'deflickerSize', 'previewRes', 'outputFolder', 'saveInSourceFolder',
+	'hardware', 'deflicker', 'deflickerSize', 'previewRes', 'outputFolder', 'saveInSourceFolder',
 }
 
 local function loadPrefs(props)
@@ -123,7 +158,7 @@ end
 local function runGeneration(props, photos, aspects)
 	local targetW, targetH = targetDims(props)
 	local outputFolder = resolveOutputFolder(props, photos)
-	local outputPath = LrPathUtils.child(outputFolder, sanitizeFileName(props.fileName))
+	local outputPath = LrPathUtils.child(outputFolder, sanitizeFileName(props.fileName, props.codec))
 
 	if LrFileUtils.exists(outputPath) then
 		local answer = LrDialogs.confirm(
@@ -177,32 +212,23 @@ local function runGeneration(props, photos, aspects)
 	end
 
 	-- Phase 2: encode with ffmpeg.
-	local quality = FFmpegCommand.resolveQualityPreset(props.qualityPreset, props.codec)
-	local crf = tonumber(props.crf) or quality.crf
-	local encoderPreset = props.encoderPreset or quality.preset
+	local encodeOpts = resolveEncodeOpts(props, targetW, targetH)
+	encodeOpts.inputPattern = result.pattern
+	encodeOpts.ffmpegPath = props.ffmpegPath
+	encodeOpts.fps = effectiveFps(props)
+	encodeOpts.width = targetW
+	encodeOpts.height = targetH
+	encodeOpts.fit = props.fit
+	encodeOpts.deflicker = props.deflicker
+	encodeOpts.deflickerSize = tonumber(props.deflickerSize)
+	encodeOpts.progressFile = LrPathUtils.child(sessionDir, 'progress.txt')
+	encodeOpts.outputPath = outputPath
 
 	local encodeScope = LrProgressScope {
 		title = LOC("$$$/Timelapse/Progress/Encode=Timelapse: encoding ^1 frames with ffmpeg...", result.count),
 	}
 	encodeScope:setCancelable(true)
-	local outcome, _, tail = FFmpegRunner.run({
-		ffmpegPath = props.ffmpegPath,
-		inputPattern = result.pattern,
-		fps = effectiveFps(props),
-		width = targetW,
-		height = targetH,
-		fit = props.fit,
-		codec = props.codec,
-		crf = crf,
-		encoderPreset = encoderPreset,
-		keyintMin = tonumber(props.keyintMin),
-		keyintMax = tonumber(props.keyintMax),
-		maxBitrate = tonumber(props.maxBitrate),
-		deflicker = props.deflicker,
-		deflickerSize = tonumber(props.deflickerSize),
-		progressFile = LrPathUtils.child(sessionDir, 'progress.txt'),
-		outputPath = outputPath,
-	}, {
+	local outcome, _, tail = FFmpegRunner.run(encodeOpts, {
 		logFile = LrPathUtils.child(sessionDir, 'ffmpeg.log'),
 		progressScope = encodeScope,
 		totalFrames = result.count,
@@ -264,6 +290,7 @@ function TimelapseDialog.show(context, args)
 	props.customFps = 30
 	props.codec = 'h264'
 	props.qualityPreset = 'medium'
+	props.hardware = false
 	props.showAdvanced = false
 	props.deflicker = false
 	props.deflickerSize = 5
@@ -272,7 +299,6 @@ function TimelapseDialog.show(context, args)
 	props.outputFolder = defaultOutputFolder()
 	props.saveInSourceFolder = false
 	loadPrefs(props)
-	props.fileName = 'timelapse_' .. os.date('%Y%m%d_%H%M%S')
 	props.previewRunning = false
 
 	-- ffmpeg detection. Path, version and the minimum-version warning are
@@ -285,12 +311,35 @@ function TimelapseDialog.show(context, args)
 		and LOC "$$$/Timelapse/FFmpeg/ConfiguredElsewhere=ffmpeg is configured."
 		or LOC "$$$/Timelapse/FFmpeg/Missing=ffmpeg not found. Configure it in Lightroom's Plug-in Manager (File > Plug-in Manager > Timelapse Creator)."
 
+	-- VideoToolbox is part of macOS, but a minimal/custom ffmpeg build could
+	-- lack it, so this is probed rather than assumed. Fixed for the life of
+	-- the dialog (no UI path changes ffmpeg mid-session).
+	local hardwareAvailable = ffmpegPath and FFmpegLocator.hasHardwareAcceleration(ffmpegPath) or false
+	if not hardwareAvailable then
+		props.hardware = false
+	end
+
+	props.fileName = sanitizeFileName('timelapse_' .. os.date('%Y%m%d_%H%M%S'), props.codec)
+
 	-- Advanced fields follow the quality preset until edited by hand.
+	-- Quality has three, mutually exclusive meanings depending on codec and
+	-- hardware/software mode (see resolveEncodeOpts): CRF+preset (software
+	-- H.264/H.265), a VideoToolbox bitrate target (hardware H.264/H.265,
+	-- which has no CRF-equivalent perceptual quality knob), or a fixed
+	-- ProRes profile (ProRes has neither CRF nor bitrate control).
 	local autoKeyint = {}
 	local function applyQualityPreset()
-		local q = FFmpegCommand.resolveQualityPreset(props.qualityPreset, props.codec)
-		props.crf = q.crf
-		props.encoderPreset = q.preset
+		if props.codec == 'prores' then
+			return -- resolved directly from qualityPreset at generation time
+		end
+		if props.hardware then
+			local w, h = targetDims(props)
+			props.maxBitrate = FFmpegCommand.resolveHardwareBitrate(props.qualityPreset, props.codec, w, h)
+		else
+			local q = FFmpegCommand.resolveQualityPreset(props.qualityPreset, props.codec)
+			props.crf = q.crf
+			props.encoderPreset = q.preset
+		end
 	end
 	local function applyKeyintDefaults()
 		local fps = math.floor(effectiveFps(props) + 0.5)
@@ -324,10 +373,20 @@ function TimelapseDialog.show(context, args)
 			applyKeyintDefaults()
 		end
 	end)
-	props:addObserver('resolution', updateSummary)
-	props:addObserver('orientation', updateSummary)
+	props:addObserver('resolution', function()
+		updateSummary()
+		applyQualityPreset() -- hardware bitrate target scales with resolution
+	end)
+	props:addObserver('orientation', function()
+		updateSummary()
+		applyQualityPreset()
+	end)
 	props:addObserver('qualityPreset', applyQualityPreset)
-	props:addObserver('codec', applyQualityPreset)
+	props:addObserver('hardware', applyQualityPreset)
+	props:addObserver('codec', function()
+		applyQualityPreset()
+		props.fileName = sanitizeFileName(props.fileName, props.codec)
+	end)
 
 	local function updateOutputFolderDisplay()
 		props.outputFolderDisplay = resolveOutputFolder(props, photos)
@@ -432,6 +491,29 @@ function TimelapseDialog.show(context, args)
 		resItems[#resItems + 1] = { title = r.title, value = r.value }
 	end
 
+	-- Small reusable visibility bindings for the codec/hardware-dependent
+	-- Advanced rows below: CRF+preset only make sense for software H.264/
+	-- H.265; bitrate only for hardware H.264/H.265; ProRes has neither (and
+	-- no keyframe/GOP concept at all, being all-intra).
+	local function bindWhen(keys, test)
+		return LrView.bind {
+			keys = keys,
+			operation = function(_, values, fromTable)
+				if fromTable then return test(values) end
+				return LrBinding.kUnsupportedDirection
+			end,
+		}
+	end
+	local function bindNotProres() return bindWhen({ 'codec' }, function(v) return v.codec ~= 'prores' end) end
+	local function bindIsProres() return bindWhen({ 'codec' }, function(v) return v.codec == 'prores' end) end
+	local function bindSoftwareH26x()
+		return bindWhen({ 'codec', 'hardware' }, function(v) return v.codec ~= 'prores' and not v.hardware end)
+	end
+	local function bindHardwareH26x()
+		return bindWhen({ 'codec', 'hardware' }, function(v) return v.codec ~= 'prores' and v.hardware end)
+	end
+	local function bindNotHardware() return bindWhen({ 'hardware' }, function(v) return not v.hardware end) end
+
 	-- Rebuilt on every presentation: the validation loop below may present
 	-- the dialog more than once, and a view object should not be reused.
 	local function buildContents()
@@ -526,6 +608,7 @@ function TimelapseDialog.show(context, args)
 									deflicker = props.deflicker,
 									deflickerSize = tonumber(props.deflickerSize),
 									ffmpegPath = props.ffmpegPath,
+									hardware = props.hardware,
 									tempRoot = tempRoot(),
 									progressScope = scope,
 								}
@@ -608,6 +691,7 @@ function TimelapseDialog.show(context, args)
 					items = {
 						{ title = 'H.264 (AVC)',  value = 'h264' },
 						{ title = 'H.265 (HEVC)', value = 'h265' },
+						{ title = 'ProRes 422',   value = 'prores' },
 					},
 				},
 				f:static_text { title = LOC "$$$/Timelapse/UI/Quality=Quality:" },
@@ -619,6 +703,25 @@ function TimelapseDialog.show(context, args)
 						{ title = LOC "$$$/Timelapse/UI/QualityLow=Low",       value = 'low' },
 					},
 				},
+			},
+
+			f:row {
+				visible = hardwareAvailable,
+				spacing = f:label_spacing(),
+				f:spacer { width = LrView.share 'label' },
+				f:checkbox {
+					title = LOC "$$$/Timelapse/UI/UseHardware=Use hardware acceleration (VideoToolbox)",
+					value = bind 'hardware',
+				},
+				f:static_text {
+					title = LOC "$$$/Timelapse/UI/UseHardwareNote=Much faster; files are usually a bit larger",
+				},
+			},
+
+			f:static_text {
+				visible = bindIsProres(),
+				fill_horizontal = 1,
+				title = LOC "$$$/Timelapse/UI/ProresNote=ProRes files are much larger than H.264/H.265 — roughly 8-10x for the same duration.",
 			},
 
 			f:row {
@@ -638,6 +741,7 @@ function TimelapseDialog.show(context, args)
 				spacing = f:control_spacing(),
 				fill_horizontal = 1,
 				f:row {
+					visible = bindSoftwareH26x(),
 					spacing = f:label_spacing(),
 					f:static_text { title = LOC "$$$/Timelapse/UI/Crf=CRF:", width = LrView.share 'label' },
 					f:edit_field { value = bind 'crf', min = 0, max = 51, precision = 0, width_in_digits = 4 },
@@ -654,19 +758,31 @@ function TimelapseDialog.show(context, args)
 					},
 				},
 				f:row {
+					visible = bindNotProres(),
 					spacing = f:label_spacing(),
 					f:static_text { title = LOC "$$$/Timelapse/UI/Keyframes=Keyframes:", width = LrView.share 'label' },
-					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMin=min interval:" },
-					f:edit_field { value = bind 'keyintMin', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMin=min interval:", enabled = bindNotHardware() },
+					f:edit_field {
+						value = bind 'keyintMin', enabled = bindNotHardware(),
+						min = 1, max = 9999, precision = 0, width_in_digits = 5,
+					},
 					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintMax=max interval:" },
 					f:edit_field { value = bind 'keyintMax', min = 1, max = 9999, precision = 0, width_in_digits = 5 },
 					f:static_text { title = LOC "$$$/Timelapse/UI/KeyintUnit=frames" },
 				},
 				f:row {
+					visible = bindSoftwareH26x(),
 					spacing = f:label_spacing(),
 					f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrate=Max bitrate:", width = LrView.share 'label' },
 					f:edit_field { value = bind 'maxBitrate', min = 0, max = 200000, precision = 0, width_in_digits = 7 },
 					f:static_text { title = LOC "$$$/Timelapse/UI/MaxBitrateUnit=kbit/s (0 = unlimited)" },
+				},
+				f:row {
+					visible = bindHardwareH26x(),
+					spacing = f:label_spacing(),
+					f:static_text { title = LOC "$$$/Timelapse/UI/TargetBitrate=Target bitrate:", width = LrView.share 'label' },
+					f:edit_field { value = bind 'maxBitrate', min = 0, max = 200000, precision = 0, width_in_digits = 7 },
+					f:static_text { title = LOC "$$$/Timelapse/UI/TargetBitrateUnit=kbit/s" },
 				},
 			},
 		},

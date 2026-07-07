@@ -2,22 +2,26 @@
 
 # Timelapse Creator — Lightroom Classic plug-in
 
-Creates a timelapse video (H.264 / H.265) from the photos selected in Adobe
-Lightroom Classic, using [ffmpeg](https://ffmpeg.org) as the encoder. The
-develop settings of every photo are applied, so what you graded in Lightroom
-is what ends up in the video.
+Creates a timelapse video (H.264, H.265, or ProRes 422) from the photos
+selected in Adobe Lightroom Classic, using [ffmpeg](https://ffmpeg.org) as
+the encoder. The develop settings of every photo are applied, so what you
+graded in Lightroom is what ends up in the video.
 
-**Status: 0.3.0 — work in progress.** SDR pipeline complete; HDR output is
+**Status: 0.4.0 — work in progress.** SDR pipeline complete; HDR output is
 under investigation (see *HDR* below).
 
 ## Features
 
 - 720p / 1080p / 4K output, landscape or portrait
-- H.264 (libx264) and H.265 (libx265, `hvc1`-tagged for Apple players)
+- H.264 (libx264), H.265 (libx265, `hvc1`-tagged for Apple players), and
+  ProRes 422 (Proxy/LT/standard/HQ, `.mov`) for professional editing pipelines
+- Optional hardware-accelerated encoding (Apple VideoToolbox), auto-detected —
+  dramatically faster, especially for H.265 (5x or more on Apple Silicon);
+  quality is controlled by target bitrate instead of CRF in this mode
 - Frame rate selection (24/25/30/60 fps, or a custom rate) — 1 photo = 1 frame
 - Fill (center crop) or fit (black bars) aspect handling
 - Quality presets plus advanced controls: CRF, encoder preset,
-  **min/max keyframe interval (GOP)**, max bitrate
+  **min/max keyframe interval (GOP)**, max/target bitrate
 - Optional ffmpeg `deflicker` filter
 - Instant frame-by-frame preview (slider + prev/next) showing each photo as
   developed, plus a fast low-resolution MP4 preview (480p/240p) opened in
@@ -102,6 +106,9 @@ lua scripts/check_version.lua
    publishes a GitHub release with the zip attached (`gh` CLI required).
    Requires the Lightroom Classic SDK locally (not part of this repo — see
    `ADOBE_LUAC` in `scripts/release.sh` if it's not at the default path).
+
+The integration test also exercises hardware encoding and ProRes when run on
+a machine with VideoToolbox (skipped otherwise).
 
 See [PLAN.md](PLAN.md) for the full design and roadmap.
 

@@ -89,6 +89,49 @@ check('hdr hlg trc', contains(args, '-color_trc', 'arib-std-b67'))
 args = C.buildArgs(baseOpts{ progressFile = '/tmp/progress.txt' })
 check('progress file', contains(args, '-progress', '/tmp/progress.txt') and contains(args, '-nostats'))
 
+------------------------------------------------------------- hardware (VideoToolbox)
+
+args = C.buildArgs(baseOpts{ hardware = true })
+check('hw h264 encoder', contains(args, '-c:v', 'h264_videotoolbox'))
+check('hw h264 bitrate', contains(args, '-b:v', '8000k'))
+check('hw h264 no crf', not contains(args, '-crf', '21'))
+check('hw h264 no preset', not contains(args, '-preset', 'medium'))
+check('hw h264 keyint via -g', contains(args, '-g', '300'))
+check('hw h264 no keyint_min', not contains(args, '-keyint_min', '30'))
+
+args = C.buildArgs(baseOpts{ codec = 'h265', hardware = true, bitrate = 5000 })
+check('hw h265 encoder', contains(args, '-c:v', 'hevc_videotoolbox'))
+check('hw h265 bitrate override', contains(args, '-b:v', '5000k'))
+check('hw h265 still tagged hvc1', contains(args, '-tag:v', 'hvc1'))
+check('hw h265 no x265-params', not contains(args, '-x265-params'))
+
+args = C.buildArgs(baseOpts{ hardware = true, maxBitrate = 8000 })
+check('hw ignores software maxrate cap', not contains(args, '-maxrate', '8000k'))
+
+args = C.buildArgs(baseOpts{ codec = 'h265', hardware = true, hdr = 'pq' })
+check('hw hdr color tags still applied', contains(args, '-color_trc', 'smpte2084'))
+local hasX265ParamsHw = false
+for i = 1, #args do if args[i] == '-x265-params' then hasX265ParamsHw = true end end
+check('hw hdr has no x265-params (not x265 at all)', not hasX265ParamsHw)
+
+--------------------------------------------------------------------- prores
+
+args = C.buildArgs(baseOpts{ codec = 'prores', proresProfile = 3 })
+check('prores software encoder', contains(args, '-c:v', 'prores_ks'))
+check('prores profile', contains(args, '-profile:v', '3'))
+check('prores no crf', not contains(args, '-crf'))
+check('prores no preset', not contains(args, '-preset'))
+check('prores no tag hvc1', not contains(args, '-tag:v', 'hvc1'))
+check('prores no keyint (all-intra)', not contains(args, '-g', '300') and not contains(args, '-keyint_min'))
+check('prores ignores maxBitrate cap', not contains(args, '-maxrate'))
+local vfProres
+for i = 1, #args - 1 do if args[i] == '-vf' then vfProres = args[i + 1] end end
+check('prores 10-bit 422 pixel format', vfProres:find('format=yuv422p10le', 1, true) ~= nil, vfProres)
+
+args = C.buildArgs(baseOpts{ codec = 'prores', hardware = true })
+check('prores hardware encoder', contains(args, '-c:v', 'prores_videotoolbox'))
+check('prores default profile (medium/standard)', contains(args, '-profile:v', '2'))
+
 ---------------------------------------------------------------- buildCommand
 
 local cmd = C.buildCommand(baseOpts(), false)
@@ -147,6 +190,33 @@ for _, name in ipairs{ 'high', 'medium', 'low' } do
 	end
 end
 check('preset fallback', C.resolveQualityPreset('bogus', 'h264').crf == 21)
+
+------------------------------------------------------- hardware bitrate / prores
+
+-- 1080p (~2.07 MP) h264 medium: documented as ~4.8 Mbps/MP -> ~10 Mbps
+local kbps = C.resolveHardwareBitrate('medium', 'h264', 1920, 1080)
+check('hw bitrate 1080p h264 medium in reasonable range', kbps > 8000 and kbps < 12000, kbps)
+
+-- 4K should scale ~4x over 1080p (4x the pixels) for the same tier/codec
+local kbps4k = C.resolveHardwareBitrate('medium', 'h264', 3840, 2160)
+check('hw bitrate scales with resolution', kbps4k > kbps * 3.5 and kbps4k < kbps * 4.5,
+	kbps .. ' -> ' .. kbps4k)
+
+-- h265 should target a noticeably lower bitrate than h264 for the same tier
+local kbpsH265 = C.resolveHardwareBitrate('medium', 'h265', 1920, 1080)
+check('hw bitrate h265 lower than h264 at same tier', kbpsH265 < kbps, kbpsH265 .. ' vs ' .. kbps)
+
+check('hw bitrate unknown tier falls back to medium',
+	C.resolveHardwareBitrate('bogus', 'h264', 1920, 1080) == kbps)
+
+check('prores profile high', C.resolveProresProfile('high') == 3)
+check('prores profile medium', C.resolveProresProfile('medium') == 2)
+check('prores profile low', C.resolveProresProfile('low') == 1)
+check('prores profile fallback', C.resolveProresProfile('bogus') == 2)
+
+check('file extension prores', C.fileExtensionForCodec('prores') == 'mov')
+check('file extension h264', C.fileExtensionForCodec('h264') == 'mp4')
+check('file extension h265', C.fileExtensionForCodec('h265') == 'mp4')
 
 ------------------------------------------------------------- isVersionAtLeast
 

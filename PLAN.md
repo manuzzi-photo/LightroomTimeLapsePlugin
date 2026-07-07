@@ -555,6 +555,169 @@ Riepilogo per non ripetere la ricerca:
   GPLv3 è compatibile, ma va incluso il testo di licenza di ffmpeg nel
   pacchetto "con ffmpeg" ed etichettata chiaramente la variante.
 
+## Versione 0.4.0 — ✅ implementata (2026-07-08)
+
+Due richieste collegate: accelerazione hardware (per la lentezza lamentata
+nella generazione) e nuove opzioni codec professionali. Trattate insieme
+perché entrambe toccano la stessa parte di `FFmpegCommand.lua` e perché
+ProRes beneficia della stessa accelerazione hardware di H.264/H.265.
+
+### Benchmark di partenza (fatto, macOS/Apple Silicon, M1 Max)
+
+600 fotogrammi JPEG 4K (3840×2160), timelapse di 20s a 30fps, confronto
+software vs `VideoToolbox` (unica API di accelerazione hardware su macOS,
+già presente in ffmpeg via `h264_videotoolbox`/`hevc_videotoolbox`/
+`prores_videotoolbox`, nessuna dipendenza aggiuntiva):
+
+| Encoder | Tempo reale | CPU usata | File |
+|---|---|---|---|
+| x264 software (medium, CRF21) | 9,9s | 67,6s | 36,5 MB |
+| x264 hardware (20 Mbps) | 6,5s | 4,4s | 49,9 MB |
+| x265 software (medium, CRF23) | **34,1s** | 259s | 34,3 MB |
+| x265 hardware (12 Mbps) | **6,5s** | 4,4s | 30,3 MB |
+
+Il guadagno più rilevante è su H.265 (5,3×) — verosimilmente la causa
+principale della lentezza segnalata. Verificato anche: `-g` (intervallo
+keyframe) funziona correttamente in hardware (keyframe esattamente ogni N
+fotogrammi, confermato via `ffprobe`); `hevc_videotoolbox` supporta anche
+10-bit (`p010le`, rilevante per l'HDR rimandato). Non misurata con
+precisione la differenza di qualità a parità di bitrate (VMAF a 4K troppo
+lento per questa verifica) — per esperienza nota del settore, VideoToolbox
+è leggermente meno efficiente per bit di x264/x265 ben tarati, ma il
+compromesso è ampiamente a favore della velocità per un tool come questo.
+
+### 1. Accelerazione hardware (VideoToolbox) — ✅ implementato
+
+- **Rilevamento**: probe una tantum (tipo `FFmpegLocator`) che verifica la
+  presenza di `h264_videotoolbox`/`hevc_videotoolbox`/`prores_videotoolbox`
+  nell'output di `ffmpeg -encoders` del binario configurato — VideoToolbox
+  è parte del sistema operativo, ma un build ffmpeg minimale/custom
+  potrebbe non includerlo, quindi non si assume disponibile solo perché
+  siamo su macOS.
+- **UI**: checkbox "Usa accelerazione hardware" nel gruppo Codifica,
+  visibile solo se rilevata disponibile. **Default: ON quando disponibile**
+  — scelta deliberata perché la richiesta nasce proprio dalla lentezza
+  osservata e il compromesso qualitativo è minore; disattivabile con un
+  click per chi preferisce la resa migliore di x264/x265 software.
+- **`FFmpegCommand.buildArgs`**: nuovo `opts.hardware` (boolean).
+  - Selezione encoder: `hardware and (codec=='h265' and 'hevc_videotoolbox'
+    or codec=='h264' and 'h264_videotoolbox' or 'prores_videotoolbox')`,
+    altrimenti gli encoder software attuali.
+  - **Keyframe**: VideoToolbox produce GOP a intervallo fisso (verificato:
+    `-g N` senza equivalente di `-keyint_min`) — in modalità hardware si usa
+    solo `-g <keyintMax>`, il campo "intervallo min" si disabilita in UI con
+    una nota, non ha un corrispettivo hardware.
+  - **Qualità**: niente CRF/preset in VideoToolbox — controllo primario via
+    `-b:v` (bitrate target). Il campo "Bitrate max" già esistente in
+    Avanzate viene **riusato** come bitrate primario in modalità hardware
+    (etichetta dinamica: "limite" in software, "target" in hardware),
+    evitando un campo UI parallelo.
+  - **x265-params** (HDR, keyint fine) si applicano solo se `not hardware`
+    — VideoToolbox non è x265, quelle opzioni non hanno senso lì.
+- **Mappatura qualità → bitrate (hardware)**: formula per megapixel invece
+  di una tabella fissa per risoluzione (si adatta automaticamente se in
+  futuro cambiano le risoluzioni offerte):
+  ```lua
+  FFmpegCommand.hardwareBitratePerMP = {
+      h264   = { high = 7.7, medium = 4.8, low = 2.4 }, -- Mbps/MP
+      h265   = { high = 3.5, medium = 2.2, low = 1.1 },
+      prores = nil, -- ProRes non usa bitrate target, vedi punto 2
+  }
+  -- bitrate_kbps = mbpsPerMP * (width*height/1e6) * 1000
+  ```
+  Valori di partenza da linee guida comuni di streaming/delivery (es. 1080p
+  H.264 qualità alta ≈ 16 Mbps, media ≈ 10, bassa ≈ 5); scalano linearmente
+  coi megapixel per 720p/4K. Regolabili in un secondo momento senza cambiare
+  l'architettura.
+- **Preview veloce**: la generazione dell'anteprima MP4 (`PreviewBuilder`,
+  oggi sempre H.264 software `ultrafast`/CRF28) passa a `h264_videotoolbox`
+  quando disponibile — è già ottimizzata per la velocità, il caso d'uso
+  ideale per l'hardware.
+- **Annullamento**: nessuna modifica necessaria — il meccanismo
+  background+PID+`SIGINT` di `FFmpegRunner` (0.3.0) è agnostico rispetto
+  all'encoder interno, la stessa gestione vale identica per i processi
+  ffmpeg con VideoToolbox.
+- **Fuori scope**: accelerazione hardware su Windows (NVENC/QuickSync/AMF —
+  API completamente diverse, nessuna base di codice da riusare oltre
+  all'astrazione già presente in `Platform.lua`); HDR via hardware (resta
+  bloccato sullo spike dell'export Lightroom, non sull'encoder).
+
+### 2. ProRes 422 come terzo codec — ✅ implementato
+
+Aggiunta mirata: solo **ProRes 422** (profili Proxy/LT/422/HQ), non ancora
+DNxHR o AV1 — tenuti come candidati per una versione successiva una volta
+consolidato il pattern con ProRes, per non far esplodere lo scope di
+questo passaggio.
+
+- **UI**: terza voce nel popup Codec ("ProRes 422"). Quando selezionata:
+  - i controlli CRF/preset/max bitrate di Avanzate si nascondono (non
+    applicabili);
+  - il preset Qualità (Alta/Media/Bassa) rimane lo stesso menu già in uso,
+    ma per ProRes seleziona il **profilo** invece di CRF: Bassa→ProRes 422
+    LT, Media→ProRes 422 (standard), Alta→ProRes 422 HQ. Mantiene coerente
+    il significato del menu Qualità a prescindere dal codec scelto.
+- **`FFmpegCommand.buildArgs`**: per `codec == 'prores'`:
+  - encoder `prores_videotoolbox` (se `hardware`) o `prores_ks` (software,
+    il migliore encoder ProRes software disponibile in ffmpeg);
+  - profilo passato via `-profile:v <0..3>` (proxy/lt/standard/hq);
+  - **pixel format**: ProRes è nativamente 10-bit 4:2:2, non 4:2:0 come
+    H.264/H.265 — la catena filtri deve produrre `yuv422p10le` invece di
+    `yuv420p` quando `codec == 'prores'` (verificato: `prores_ks` richiede
+    esplicitamente `yuv422p10le`/444; `prores_videotoolbox` accetta formati
+    10-bit 422 equivalenti come `p210le`, con conversione automatica di
+    ffmpeg se serve);
+  - nessun `-crf`, `-preset`, `-tag:v hvc1`, `-x265-params`, `-maxrate` (non
+    pertinenti a ProRes).
+- **Container**: ProRes si distribuisce convenzionalmente in **.mov**, non
+  .mp4. `sanitizeFileName` (in `TimelapseDialog.lua`) sceglie l'estensione
+  in base al codec; il nome file proposto di default si aggiorna di
+  conseguenza quando si cambia codec.
+- **Dimensione file**: da comunicare in UI (nota testuale) — ProRes 422 HQ
+  a 4K produce file molto più grandi di H.265 (indicativamente 8-10× per
+  la stessa durata), attesissimo per chi lo usa ma da non far scoprire
+  all'utente solo a esportazione finita.
+
+### File coinvolti (riepilogo)
+
+```
+TimelapseCreator.lrdevplugin/
+├── FFmpegCommand.lua       -- + opts.hardware, encoder ProRes, hardwareBitratePerMP,
+│                              filtro pixel format condizionale per ProRes
+├── FFmpegLocator.lua       -- + probe disponibilità VideoToolbox (encoders list)
+├── PreviewBuilder.lua      -- usa hardware per la preview quando disponibile
+├── TimelapseDialog.lua     -- checkbox hardware, voce ProRes nel codec, UI Avanzate
+│                              condizionale (nascondere CRF/preset per ProRes/hardware,
+│                              etichetta dinamica su "Bitrate"), estensione file dinamica
+└── TranslatedStrings_it.txt -- nuove stringhe
+
+tests/test_ffmpeg_command.lua -- + casi per hardware=true (h264/h265), per codec=prores,
+                                  per hardwareBitratePerMP
+```
+
+Nessun impatto sulla pipeline di export dei fotogrammi (`FrameExporter`) né
+sul meccanismo di annullamento (`FFmpegRunner`) — entrambi agnostici
+rispetto a encoder/codec scelto.
+
+### Verifica fatta fuori Lightroom
+
+Con encode reali (non solo comandi generati), tutte e 4 le combinazioni
+nuove producono file corretti (verificato via `ffprobe`): `h264_videotoolbox`
+(H.264 High, yuv420p), `hevc_videotoolbox` (HEVC Main, yuv420p),
+`prores_ks` (ProRes HQ, yuv422p10le) e — punto delicato — `prores_videotoolbox`
+produce comunque output 10-bit 4:2:2 corretto nonostante quel pixel format
+non compaia esplicitamente tra i "supported pixel formats" dell'encoder
+(ffmpeg negozia la conversione automaticamente). Aggiunti come casi
+permanenti in `tests/integration_ffmpeg.sh` (con skip automatico se
+VideoToolbox non è disponibile sulla macchina).
+
+**Da verificare in Lightroom** (non testabile fuori): reattività dei
+controlli quando si cambiano codec/hardware nel dialog reale (visibilità
+condizionale dei campi Avanzate, aggiornamento dell'estensione del nome
+file), e che il probe di `FFmpegLocator.hasHardwareAcceleration` (che shella
+fuori, quindi yielda) non riproponga un problema di contesto ristretto —
+è chiamato in sequenza sincrona subito dopo `FFmpegLocator.locate()` nello
+stesso punto del codice, quindi stesso contesto già validato.
+
 ## Rischi e punti aperti
 
 1. **Export HDR via SDK** *(rischio principale)* — l'SDK potrebbe non esporre i formati

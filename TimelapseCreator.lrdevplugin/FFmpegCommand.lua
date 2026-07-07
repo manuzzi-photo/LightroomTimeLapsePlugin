@@ -19,6 +19,25 @@ FFmpegCommand.qualityPresets = {
 	low    = { h264 = { crf = 26, preset = 'fast' },   h265 = { crf = 28, preset = 'fast' } },
 }
 
+-- Hardware encoders (VideoToolbox) have no CRF-equivalent perceptual quality
+-- knob; quality is controlled by target bitrate instead, scaled by
+-- resolution so the same quality tier looks reasonable at 720p and 4K alike.
+-- Values are Mbps per megapixel, derived from common streaming/delivery
+-- bitrate guidelines (e.g. ~16/10/5 Mbps for 1080p H.264 high/medium/low).
+FFmpegCommand.hardwareBitratePerMP = {
+	h264 = { high = 7.7, medium = 4.8, low = 2.4 },
+	h265 = { high = 3.5, medium = 2.2, low = 1.1 },
+}
+
+-- ProRes has no bitrate/CRF control either: quality is selected via a fixed
+-- profile. Reuses the same high/medium/low tiers as the other codecs so the
+-- Quality menu keeps a consistent meaning regardless of codec.
+FFmpegCommand.proresProfiles = {
+	high   = 3, -- 422 HQ
+	medium = 2, -- 422 (standard)
+	low    = 1, -- 422 LT
+}
+
 --------------------------------------------------------------------------------
 -- Shell quoting
 --------------------------------------------------------------------------------
@@ -107,7 +126,10 @@ function FFmpegCommand.buildFilterChain(opts)
 		filters[#filters + 1] = string.format('crop=%d:%d', w, h)
 	end
 
-	if opts.hdr == 'pq' or opts.hdr == 'hlg' then
+	if opts.codec == 'prores' then
+		-- ProRes is natively 10-bit 4:2:2, unlike the 4:2:0 used for H.264/H.265.
+		filters[#filters + 1] = 'format=yuv422p10le'
+	elseif opts.hdr == 'pq' or opts.hdr == 'hlg' then
 		filters[#filters + 1] = 'format=yuv420p10le'
 	else
 		filters[#filters + 1] = 'format=yuv420p'
@@ -128,14 +150,17 @@ end
 --   fps            (number)  output frame rate; 1 photo = 1 frame
 --   width, height  (number)  final video dimensions
 --   fit            (string)  'crop' | 'pad'
---   codec          (string)  'h264' | 'h265'
---   crf            (number)
---   encoderPreset  (string)  ultrafast..placebo
---   keyintMin      (number|nil)  minimum keyframe interval (frames)
+--   codec          (string)  'h264' | 'h265' | 'prores'
+--   hardware       (boolean|nil)  use VideoToolbox instead of software x264/x265/ProRes
+--   crf            (number)  software h264/h265 only
+--   encoderPreset  (string)  ultrafast..placebo; software h264/h265 only
+--   bitrate        (number|nil)  target kbit/s; hardware h264/h265 only (no CRF equivalent)
+--   proresProfile  (number|nil)  0=proxy 1=lt 2=standard 3=hq; prores only, default 2
+--   keyintMin      (number|nil)  minimum keyframe interval (frames); software only
 --   keyintMax      (number|nil)  maximum keyframe interval (frames)
---   maxBitrate     (number|nil)  cap in kbit/s; nil or 0 disables
+--   maxBitrate     (number|nil)  cap in kbit/s; software h264/h265 only, nil or 0 disables
 --   deflicker      (boolean), deflickerSize (number|nil)
---   hdr            (nil|'pq'|'hlg')  EXPERIMENTAL, h265 only
+--   hdr            (nil|'pq'|'hlg')  EXPERIMENTAL, software h265 only
 --   progressFile   (string|nil)  file that receives -progress output
 --   outputPath     (string)
 function FFmpegCommand.buildArgs(opts)
@@ -155,16 +180,34 @@ function FFmpegCommand.buildArgs(opts)
 
 	add('-vf', FFmpegCommand.buildFilterChain(opts))
 
+	local isProres = (opts.codec == 'prores')
 	local isH265 = (opts.codec == 'h265')
-	add('-c:v', isH265 and 'libx265' or 'libx264')
-	add('-preset', opts.encoderPreset or 'medium')
-	add('-crf', opts.crf or 21)
+	local hardware = (opts.hardware == true) -- VideoToolbox applies to all three codecs alike
+
+	if isProres then
+		add('-c:v', hardware and 'prores_videotoolbox' or 'prores_ks')
+		add('-profile:v', opts.proresProfile or FFmpegCommand.proresProfiles.medium)
+	elseif hardware then
+		add('-c:v', isH265 and 'hevc_videotoolbox' or 'h264_videotoolbox')
+		add('-b:v', (opts.bitrate or 8000) .. 'k')
+	else
+		add('-c:v', isH265 and 'libx265' or 'libx264')
+		add('-preset', opts.encoderPreset or 'medium')
+		add('-crf', opts.crf or 21)
+	end
 
 	-- Keyframe interval (GOP): x264 honors -g/-keyint_min, x265 only honors
-	-- -g, so min-keyint must go through -x265-params.
+	-- -g (min-keyint must go through -x265-params). ProRes is all-intra, no
+	-- GOP concept. VideoToolbox produces a fixed-length GOP via -g alone —
+	-- confirmed empirically (keyframes land at exactly every Nth frame) —
+	-- and has no minimum-interval equivalent to -keyint_min.
 	local keyintMin, keyintMax = opts.keyintMin, opts.keyintMax
 	local x265params = {}
-	if isH265 then
+	if isProres then
+		-- nothing to set
+	elseif hardware then
+		if keyintMax then add('-g', keyintMax) end
+	elseif isH265 then
 		if keyintMax then x265params[#x265params + 1] = 'keyint=' .. keyintMax end
 		if keyintMin then x265params[#x265params + 1] = 'min-keyint=' .. keyintMin end
 	else
@@ -172,26 +215,28 @@ function FFmpegCommand.buildArgs(opts)
 		if keyintMin then add('-keyint_min', keyintMin) end
 	end
 
-	if opts.hdr == 'pq' or opts.hdr == 'hlg' then
-		-- EXPERIMENTAL: requires 10/16-bit input frames already encoded with
-		-- the corresponding transfer function. H.265 only.
-		local trc = (opts.hdr == 'pq') and 'smpte2084' or 'arib-std-b67'
-		add('-color_primaries', 'bt2020')
-		add('-color_trc', trc)
-		add('-colorspace', 'bt2020nc')
-		if isH265 then
-			x265params[#x265params + 1] = 'colorprim=bt2020'
-			x265params[#x265params + 1] = 'transfer=' .. trc
-			x265params[#x265params + 1] = 'colormatrix=bt2020nc'
-			x265params[#x265params + 1] = 'repeat-headers=1'
-			if opts.hdr == 'pq' then
-				x265params[#x265params + 1] = 'hdr10=1'
+	if not isProres then
+		if opts.hdr == 'pq' or opts.hdr == 'hlg' then
+			-- EXPERIMENTAL: requires 10/16-bit input frames already encoded
+			-- with the corresponding transfer function. Software H.265 only.
+			local trc = (opts.hdr == 'pq') and 'smpte2084' or 'arib-std-b67'
+			add('-color_primaries', 'bt2020')
+			add('-color_trc', trc)
+			add('-colorspace', 'bt2020nc')
+			if isH265 and not hardware then
+				x265params[#x265params + 1] = 'colorprim=bt2020'
+				x265params[#x265params + 1] = 'transfer=' .. trc
+				x265params[#x265params + 1] = 'colormatrix=bt2020nc'
+				x265params[#x265params + 1] = 'repeat-headers=1'
+				if opts.hdr == 'pq' then
+					x265params[#x265params + 1] = 'hdr10=1'
+				end
 			end
+		else
+			add('-color_primaries', 'bt709')
+			add('-color_trc', 'bt709')
+			add('-colorspace', 'bt709')
 		end
-	else
-		add('-color_primaries', 'bt709')
-		add('-color_trc', 'bt709')
-		add('-colorspace', 'bt709')
 	end
 
 	if #x265params > 0 then
@@ -199,10 +244,10 @@ function FFmpegCommand.buildArgs(opts)
 	end
 
 	if isH265 then
-		add('-tag:v', 'hvc1') -- required by Apple players
+		add('-tag:v', 'hvc1') -- required by Apple players, software and hardware alike
 	end
 
-	if opts.maxBitrate and opts.maxBitrate > 0 then
+	if not isProres and not hardware and opts.maxBitrate and opts.maxBitrate > 0 then
 		add('-maxrate', opts.maxBitrate .. 'k')
 		add('-bufsize', (opts.maxBitrate * 2) .. 'k')
 	end
@@ -235,10 +280,32 @@ function FFmpegCommand.buildCommand(opts, isWindows)
 end
 
 -- Convenience: resolves a quality preset name into { crf, preset } for codec.
+-- Software h264/h265 only — see resolveHardwareBitrate and resolveProresProfile.
 function FFmpegCommand.resolveQualityPreset(presetName, codec)
 	local preset = FFmpegCommand.qualityPresets[presetName]
 		or FFmpegCommand.qualityPresets.medium
 	return preset[codec] or preset.h264
+end
+
+-- Resolves a quality preset name into a target bitrate (kbit/s) for
+-- hardware (VideoToolbox) h264/h265 encoding, scaled by resolution.
+function FFmpegCommand.resolveHardwareBitrate(presetName, codec, width, height)
+	local perMP = FFmpegCommand.hardwareBitratePerMP[codec]
+		or FFmpegCommand.hardwareBitratePerMP.h264
+	local mbpsPerMP = perMP[presetName] or perMP.medium
+	local megapixels = (width * height) / 1000000
+	return math.max(500, math.floor(mbpsPerMP * megapixels * 1000 + 0.5))
+end
+
+-- Resolves a quality preset name into a ProRes profile number (see
+-- FFmpegCommand.proresProfiles).
+function FFmpegCommand.resolveProresProfile(presetName)
+	return FFmpegCommand.proresProfiles[presetName] or FFmpegCommand.proresProfiles.medium
+end
+
+-- ProRes ships in a .mov container by convention; H.264/H.265 use .mp4.
+function FFmpegCommand.fileExtensionForCodec(codec)
+	return (codec == 'prores') and 'mov' or 'mp4'
 end
 
 -- Rounds a dimension down to the nearest even number (required by yuv420).

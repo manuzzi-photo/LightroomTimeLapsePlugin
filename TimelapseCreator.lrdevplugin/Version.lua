@@ -9,8 +9,8 @@ this file.
 
 return {
 	major = 0,
-	minor = 3,
+	minor = 4,
 	revision = 0,
 	build = 0,
-	display = '0.3.0',
+	display = '0.4.0',
 }
