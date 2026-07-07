@@ -110,6 +110,9 @@ lua scripts/check_version.lua
 The integration test also exercises hardware encoding and ProRes when run on
 a machine with VideoToolbox (skipped otherwise).
 
+See [docs/usage.md](docs/usage.md) (English) or [docs/usage.it.md](docs/usage.it.md)
+(Italiano) for a full walkthrough with screenshots.
+
 See [PLAN.md](PLAN.md) for the full design and roadmap.
 
 ## License
