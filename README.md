@@ -10,6 +10,9 @@ graded in Lightroom is what ends up in the video.
 **Status: 0.4.0 — work in progress.** SDR pipeline complete; HDR output is
 under investigation (see *HDR* below).
 
+📖 **Usage guide with screenshots:** [English](docs/usage.md) ·
+[Italiano](docs/usage.it.md)
+
 ## Features
 
 - 720p / 1080p / 4K output, landscape or portrait
@@ -109,9 +112,6 @@ lua scripts/check_version.lua
 
 The integration test also exercises hardware encoding and ProRes when run on
 a machine with VideoToolbox (skipped otherwise).
-
-See [docs/usage.md](docs/usage.md) (English) or [docs/usage.it.md](docs/usage.it.md)
-(Italiano) for a full walkthrough with screenshots.
 
 See [PLAN.md](PLAN.md) for the full design and roadmap.
 
